@@ -1,0 +1,6 @@
+bin/
+obj/
+game/
+*.zip
+*.user
+*.suo

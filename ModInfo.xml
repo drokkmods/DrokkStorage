@@ -1,0 +1,8 @@
+<?xml version="1.0" encoding="UTF-8" ?>
+<xml>
+	<Name value="DrokkStorage" />
+  	<DisplayName value="Drokk Storage" />
+	<Description value="Allows multiple players to view storage containers and workbenches simultaneously." />
+	<Author value="drokk" />
+	<Version value="1.0.0" />
+</xml>
