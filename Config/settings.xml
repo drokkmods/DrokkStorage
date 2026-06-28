@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="UTF-8" ?>
+<DrokkStorage>
+	<!-- Range in blocks to search nearby containers when crafting, repairing/upgrading,
+	     reloading and refueling. Default 15. -->
+	<ContainerRange value="15" />
+
+	<!-- Radius in blocks (applied to each axis) searched when Quick Stacking / Restocking
+	     into nearby containers. Default 15. -->
+	<QuickStackDistance value="15" />
+</DrokkStorage>

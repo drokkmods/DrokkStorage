@@ -13,7 +13,7 @@ public class DrokkStorageConfig
 {
     public bool craftFromContainersEnabled = true;
     public bool enableForRepairAndUpgrade = true;
-    public float range = 10f; // Range in blocks to search for containers
+    public float range = 20f; // Range in blocks to search for containers
     public bool allowLockedContainers = true;
     public bool enableForReload = true;
     public bool enableForRefuel = true;
@@ -37,7 +37,7 @@ public class DrokkStorageConfig
 
     // QuickStack settings
     public bool lockModeIconVisible = true;
-    public Vector3i stashDistance = new Vector3i(7, 7, 7);
+    public Vector3i stashDistance = new Vector3i(20, 20, 20);
     public KeyCode[] quickLockHotkeys = new KeyCode[] { KeyCode.LeftAlt };
     public KeyCode[] quickStackHotkeys = new KeyCode[] { KeyCode.LeftAlt, KeyCode.X };
     public KeyCode[] quickRestockHotkeys = new KeyCode[] { KeyCode.LeftAlt, KeyCode.Z };
@@ -59,6 +59,7 @@ public class DrokkStorage : IModApi
     public void InitMod(Mod _modInstance)
     {
         Log.Out(" [DrokkStorage] Loading MultipleViewers Mod (v2.1 with Quest Fix)");
+        LoadConfig(_modInstance);
         var harmony = new Harmony(GetType().ToString());
         harmony.PatchAll(Assembly.GetExecutingAssembly());
 
@@ -91,6 +92,47 @@ public class DrokkStorage : IModApi
         }
     }
     
+    // Loads user-editable distance settings from Config/settings.xml in the mod folder.
+    // Any value that is missing or unparseable falls back to the hardcoded default in
+    // DrokkStorageConfig, so a malformed/edited file can never stop the mod from loading.
+    private static void LoadConfig(Mod _modInstance)
+    {
+        try
+        {
+            string path = System.IO.Path.Combine(_modInstance.Path, "Config", "settings.xml");
+            if (!System.IO.File.Exists(path))
+            {
+                Log.Warning($" [DrokkStorage] Config not found at {path}, using defaults.");
+                return;
+            }
+
+            var doc = new System.Xml.XmlDocument();
+            doc.Load(path);
+
+            var rangeNode = doc.SelectSingleNode("/DrokkStorage/ContainerRange");
+            if (rangeNode?.Attributes?["value"] != null &&
+                float.TryParse(rangeNode.Attributes["value"].Value, System.Globalization.NumberStyles.Float,
+                    System.Globalization.CultureInfo.InvariantCulture, out float range))
+            {
+                config.range = range;
+            }
+
+            var stashNode = doc.SelectSingleNode("/DrokkStorage/QuickStackDistance");
+            if (stashNode?.Attributes?["value"] != null &&
+                int.TryParse(stashNode.Attributes["value"].Value, System.Globalization.NumberStyles.Integer,
+                    System.Globalization.CultureInfo.InvariantCulture, out int stash))
+            {
+                config.stashDistance = new Vector3i(stash, stash, stash);
+            }
+
+            Log.Out($" [DrokkStorage] Loaded config: ContainerRange={config.range}, QuickStackDistance={config.stashDistance.x}");
+        }
+        catch (Exception e)
+        {
+            Log.Error($" [DrokkStorage] Failed to load config, using defaults: {e.Message}");
+        }
+    }
+
     public static void Dbgl(object str)
     {
         if (config.isDebug)
