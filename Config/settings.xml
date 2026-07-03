@@ -7,4 +7,47 @@
 	<!-- Radius in blocks (applied to each axis) searched when Quick Stacking / Restocking
 	     into nearby containers. Default 15. -->
 	<QuickStackDistance value="15" />
+
+	<!-- Master switch for pulling from nearby containers when crafting, repairing/upgrading,
+	     reloading and refueling. Set false to disable all of the below at once. Default true. -->
+	<CraftFromContainersEnabled value="true" />
+
+	<!-- Allow repairing/upgrading blocks using materials from nearby containers. Default true. -->
+	<EnableForRepairAndUpgrade value="true" />
+
+	<!-- Allow reloading weapons using ammo from nearby containers. Default true. -->
+	<EnableForReload value="true" />
+
+	<!-- Allow refueling (generators, vehicles, etc.) using fuel from nearby containers. Default true. -->
+	<EnableForRefuel value="true" />
+
+	<!-- Allow pulling from containers that are locked but you already have access to (owner or
+	     correct keypad code) as part of your normal pull range. This does NOT let you pull from
+	     containers locked by other players that you have no access to — that check always applies
+	     regardless of this setting. Set false to exclude even your own locked containers, requiring
+	     them to be unlocked to be auto-pulled from. Default true. -->
+	<AllowLockedContainers value="true" />
+
+	<!-- Allow multiple players to view/modify the same container at once (SHARED locks).
+	     Set false to restore vanilla single-viewer behavior. Default true. -->
+	<MultiViewersEnabled value="true" />
+
+	<!-- Count owned, unlocked vehicle storage as a pullable source. Default true. -->
+	<PullFromVehicles value="true" />
+
+	<!-- Count owned drone storage as a pullable source. Default true. -->
+	<PullFromDrones value="true" />
+
+	<!-- Count workstation OUTPUT slots (forge, campfire, etc.) as a pullable source. Default true. -->
+	<PullFromWorkstationOutputs value="true" />
+
+	<!-- Count dew collectors / apiaries as a pullable source. Default true. -->
+	<PullFromDewCollectors value="true" />
+
+	<!-- Refresh pinned recipe trackers / open crafting windows when a nearby workstation
+	     finishes crafting/cooking. Default true. -->
+	<LiveRecipeTracking value="true" />
+
+	<!-- Show the lock-mode toggle icon in the player controls UI. Default true. -->
+	<LockModeIconVisible value="true" />
 </DrokkStorage>

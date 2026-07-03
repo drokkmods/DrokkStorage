@@ -125,11 +125,38 @@ public class DrokkStorage : IModApi
                 config.stashDistance = new Vector3i(stash, stash, stash);
             }
 
-            Log.Out($" [DrokkStorage] Loaded config: ContainerRange={config.range}, QuickStackDistance={config.stashDistance.x}");
+            LoadBool(doc, "CraftFromContainersEnabled", v => config.craftFromContainersEnabled = v);
+            LoadBool(doc, "EnableForRepairAndUpgrade", v => config.enableForRepairAndUpgrade = v);
+            LoadBool(doc, "EnableForReload", v => config.enableForReload = v);
+            LoadBool(doc, "EnableForRefuel", v => config.enableForRefuel = v);
+            LoadBool(doc, "AllowLockedContainers", v => config.allowLockedContainers = v);
+            LoadBool(doc, "MultiViewersEnabled", v => config.multiViewersEnabled = v);
+            LoadBool(doc, "PullFromVehicles", v => config.pullFromVehicles = v);
+            LoadBool(doc, "PullFromDrones", v => config.pullFromDrones = v);
+            LoadBool(doc, "PullFromWorkstationOutputs", v => config.pullFromWorkstationOutputs = v);
+            LoadBool(doc, "PullFromDewCollectors", v => config.pullFromDewCollectors = v);
+            LoadBool(doc, "LiveRecipeTracking", v => config.liveRecipeTracking = v);
+            LoadBool(doc, "LockModeIconVisible", v => config.lockModeIconVisible = v);
+
+            Log.Out($" [DrokkStorage] Loaded config: ContainerRange={config.range}, QuickStackDistance={config.stashDistance.x}, "
+                + $"CraftFromContainersEnabled={config.craftFromContainersEnabled}, EnableForReload={config.enableForReload}, "
+                + $"EnableForRepairAndUpgrade={config.enableForRepairAndUpgrade}, EnableForRefuel={config.enableForRefuel}");
         }
         catch (Exception e)
         {
             Log.Error($" [DrokkStorage] Failed to load config, using defaults: {e.Message}");
+        }
+    }
+
+    // Reads /DrokkStorage/<nodeName value="true|false"/> and, if present and parseable,
+    // hands the value to apply(). Missing/malformed nodes silently leave the default untouched.
+    private static void LoadBool(System.Xml.XmlDocument doc, string nodeName, Action<bool> apply)
+    {
+        var node = doc.SelectSingleNode($"/DrokkStorage/{nodeName}");
+        if (node?.Attributes?["value"] != null &&
+            bool.TryParse(node.Attributes["value"].Value, out bool value))
+        {
+            apply(value);
         }
     }
 
