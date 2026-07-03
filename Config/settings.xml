@@ -50,4 +50,10 @@
 
 	<!-- Show the lock-mode toggle icon in the player controls UI. Default true. -->
 	<LockModeIconVisible value="true" />
+
+	<!-- Verbose per-packet/per-sync logging (container sends/receives, viewer tracking, window
+	     open/close, etc). Only needed when diagnosing a sync bug - leave false otherwise, since
+	     this logging runs on every container sync near the player and spams the console /
+	     costs frame time. Default false. -->
+	<Debug value="false" />
 </DrokkStorage>

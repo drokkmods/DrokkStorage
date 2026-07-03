@@ -137,10 +137,12 @@ public class DrokkStorage : IModApi
             LoadBool(doc, "PullFromDewCollectors", v => config.pullFromDewCollectors = v);
             LoadBool(doc, "LiveRecipeTracking", v => config.liveRecipeTracking = v);
             LoadBool(doc, "LockModeIconVisible", v => config.lockModeIconVisible = v);
+            LoadBool(doc, "Debug", v => config.isDebug = v);
 
             Log.Out($" [DrokkStorage] Loaded config: ContainerRange={config.range}, QuickStackDistance={config.stashDistance.x}, "
                 + $"CraftFromContainersEnabled={config.craftFromContainersEnabled}, EnableForReload={config.enableForReload}, "
-                + $"EnableForRepairAndUpgrade={config.enableForRepairAndUpgrade}, EnableForRefuel={config.enableForRefuel}");
+                + $"EnableForRepairAndUpgrade={config.enableForRepairAndUpgrade}, EnableForRefuel={config.enableForRefuel}, "
+                + $"Debug={config.isDebug}");
         }
         catch (Exception e)
         {
@@ -237,15 +239,18 @@ public class NetPackageCloseLootWindow : NetPackage
         }
         
         bool isServer = SingletonMonoBehaviour<ConnectionManager>.Instance.IsServer;
-        Log.Out($"[DrokkStorage] NetPackageCloseLootWindow.ProcessPackage called on {(isServer ? "SERVER" : "CLIENT")}");
-        Log.Out($"[DrokkStorage] NetPackageCloseLootWindow: LocalPlayerUI.PlayerUIs count: {LocalPlayerUI.PlayerUIs.Count}");
-        
+        if (DrokkStorage.config.isDebug)
+        {
+            Log.Out($"[DrokkStorage] NetPackageCloseLootWindow.ProcessPackage called on {(isServer ? "SERVER" : "CLIENT")}");
+            Log.Out($"[DrokkStorage] NetPackageCloseLootWindow: LocalPlayerUI.PlayerUIs count: {LocalPlayerUI.PlayerUIs.Count}");
+        }
+
         int closedCount = 0;
         foreach (var ui in LocalPlayerUI.PlayerUIs)
         {
             if (ui != null && ui.entityPlayer != null)
             {
-                Log.Out($"[DrokkStorage] NetPackageCloseLootWindow: Checking windows for player {ui.entityPlayer.entityId} ({ui.entityPlayer.EntityName})");
+                DrokkStorage.Dbgl($"NetPackageCloseLootWindow: Checking windows for player {ui.entityPlayer.entityId} ({ui.entityPlayer.EntityName})");
                 if (CloseWindowIfShowing(ui, "looting")) closedCount++;
                 if (CloseWindowIfShowing(ui, "workstation_forge")) closedCount++;
                 if (CloseWindowIfShowing(ui, "workstation_campfire")) closedCount++;
@@ -256,18 +261,18 @@ public class NetPackageCloseLootWindow : NetPackage
             }
             else
             {
-                Log.Out($"[DrokkStorage] NetPackageCloseLootWindow: Skipping null ui or entityPlayer");
+                DrokkStorage.Dbgl("NetPackageCloseLootWindow: Skipping null ui or entityPlayer");
             }
         }
-        
-        Log.Out($"[DrokkStorage] NetPackageCloseLootWindow: Closed {closedCount} windows total");
+
+        DrokkStorage.Dbgl($"NetPackageCloseLootWindow: Closed {closedCount} windows total");
     }
 
     private bool CloseWindowIfShowing(LocalPlayerUI ui, string name)
     {
         if (ui.windowManager.IsWindowOpen(name))
         {
-            Log.Out($"[DrokkStorage] Closing window '{name}' for player {ui.entityPlayer?.EntityName ?? "unknown"}");
+            DrokkStorage.Dbgl($"Closing window '{name}' for player {ui.entityPlayer?.EntityName ?? "unknown"}");
             ui.windowManager.Close(name);
             return true;
         }
@@ -345,7 +350,7 @@ public static class DrokkStoragePatches
                 Viewers[parent] = viewers;
             }
             viewers.Add(_lockingPlayerID);
-            Log.Out($"[DrokkStorage] Viewer {_lockingPlayerID} acquired shared lock on {parent}. Total viewers: {viewers.Count}");
+            DrokkStorage.Dbgl($"Viewer {_lockingPlayerID} acquired shared lock on {parent}. Total viewers: {viewers.Count}");
         }
     }
 
@@ -360,7 +365,7 @@ public static class DrokkStoragePatches
             {
                 viewers.Remove(_unlockingPlayerId);
                 if (viewers.Count == 0) Viewers.Remove(parent);
-                Log.Out($"[DrokkStorage] Viewer {_unlockingPlayerId} released lock on {parent}. Remaining viewers: {viewers.Count}");
+                DrokkStorage.Dbgl($"Viewer {_unlockingPlayerId} released lock on {parent}. Remaining viewers: {viewers.Count}");
             }
         }
     }
@@ -371,14 +376,17 @@ public static class DrokkStoragePatches
     {
         // 3.0 NetPackageTileEntity is position-only: the old bValidEntityId/teEntityId/clrIdx fields
         // are gone (entity-backed TEs no longer exist), and teWorldPos is now a public field.
+        // Debug-only: no non-logging side effects, so skip entirely when debug is off to avoid
+        // the GetTileEntity lookup on every sync packet.
         public static void Prefix(NetPackageTileEntity __instance, World _world)
         {
+            if (!DrokkStorage.config.isDebug) return;
             if (!SingletonMonoBehaviour<ConnectionManager>.Instance.IsServer) return;
 
             TileEntity tileEntity = _world.GetTileEntity(__instance.teWorldPos);
             if (tileEntity != null)
             {
-                // Log.Out($"[DrokkStorage] NetPackageTileEntity.ProcessPackage (RECEIVE) PREFIX: TE={tileEntity}, ItemsBefore={DrokkStorage.GetItemCount(tileEntity)}, Sender={__instance.Sender?.entityId ?? -1}, bUserAccessing={tileEntity.IsUserAccessing()}");
+                Log.Out($"[DrokkStorage] NetPackageTileEntity.ProcessPackage (RECEIVE) PREFIX: TE={tileEntity}, ItemsBefore={DrokkStorage.GetItemCount(tileEntity)}, Sender={__instance.Sender?.entityId ?? -1}, bUserAccessing={tileEntity.IsUserAccessing()}");
             }
         }
 
@@ -404,28 +412,28 @@ public static class DrokkStoragePatches
             // client-side only; re-broadcasting re-adds it after pickup and breaks the quest.
             if (DrokkStorage.IsQuestContainer(tileEntity))
             {
-                Log.Out($"[DrokkStorage] NetPackageTileEntity.ProcessPackage: QUEST container {tileEntity}, skipping multi-viewer echo.");
+                if (DrokkStorage.config.isDebug)
+                    Log.Out($"[DrokkStorage] NetPackageTileEntity.ProcessPackage: QUEST container {tileEntity}, skipping multi-viewer echo.");
                 return;
             }
 
-            // Log.Out($"[DrokkStorage] NetPackageTileEntity.ProcessPackage (RECEIVE) POSTFIX: TE={tileEntity}, ItemsAfter={DrokkStorage.GetItemCount(tileEntity)}, Sender={senderId}");
-
             if (Viewers.TryGetValue(tileEntity, out HashSet<int> viewers))
             {
-                Log.Out($"[DrokkStorage] Found {viewers.Count} viewers for modified container");
+                bool dbg = DrokkStorage.config.isDebug;
+                if (dbg) Log.Out($"[DrokkStorage] Found {viewers.Count} viewers for modified container");
                 List<int> viewersList = viewers.ToList();
                 foreach (int viewerId in viewersList)
                 {
-                    if (viewerId == senderId) 
+                    if (viewerId == senderId)
                     {
-                        Log.Out($"[DrokkStorage] Skipping refresh for sender {viewerId}");
+                        if (dbg) Log.Out($"[DrokkStorage] Skipping refresh for sender {viewerId}");
                         continue;
                     }
 
                     EntityPlayer viewer = _world.GetEntity(viewerId) as EntityPlayer;
-                    if (viewer == null) 
+                    if (viewer == null)
                     {
-                        Log.Out($"[DrokkStorage] Viewer {viewerId} not found in world");
+                        if (dbg) Log.Out($"[DrokkStorage] Viewer {viewerId} not found in world");
                         continue;
                     }
 
@@ -436,18 +444,18 @@ public static class DrokkStoragePatches
                         LocalPlayerUI ui = LocalPlayerUI.GetUIForPlayer(localPlayer);
                         if (ui == null || !ui.windowManager.IsWindowOpen("looting"))
                         {
-                            Log.Out($"[DrokkStorage] Host not viewing {tileEntity}, removing from viewers.");
+                            if (dbg) Log.Out($"[DrokkStorage] Host not viewing {tileEntity}, removing from viewers.");
                             viewers.Remove(viewerId);
                         }
                         else
                         {
-                            Log.Out($"[DrokkStorage] Host is viewing {tileEntity}. Smooth update should be visible.");
+                            if (dbg) Log.Out($"[DrokkStorage] Host is viewing {tileEntity}. Smooth update should be visible.");
                         }
                     }
                     else
                     {
                         // Remote player - send sync package instead of closing window
-                        Log.Out($"[DrokkStorage] Sending smooth sync to remote viewer {viewerId}");
+                        if (dbg) Log.Out($"[DrokkStorage] Sending smooth sync to remote viewer {viewerId}");
                         SingletonMonoBehaviour<ConnectionManager>.Instance.SendPackage(
                             NetPackageManager.GetPackage<NetPackageTileEntity>().Setup(tileEntity, TileEntity.StreamModeWrite.ToClient),
                             false, viewerId);
@@ -568,18 +576,22 @@ public static class DrokkStoragePatches
             // supply has been picked up. Never run multi-viewer sync on quest containers.
             if (DrokkStorage.IsQuestContainer(__instance))
             {
-                Log.Out($"[DrokkStorage] SetModified: QUEST container {__instance}, leaving to vanilla (no multi-viewer sync).");
+                if (DrokkStorage.config.isDebug)
+                    Log.Out($"[DrokkStorage] SetModified: QUEST container {__instance}, leaving to vanilla (no multi-viewer sync).");
                 return;
             }
 
             if (!isServer)
             {
-                Log.Out($"[DrokkStorage] SetModified (TRIGGER SYNC) on CLIENT for {__instance}. Items: {DrokkStorage.GetItemCount(__instance)}");
+                if (DrokkStorage.config.isDebug)
+                    Log.Out($"[DrokkStorage] SetModified (TRIGGER SYNC) on CLIENT for {__instance}. Items: {DrokkStorage.GetItemCount(__instance)}");
                 return;
             }
 
             if (DrokkStoragePatches.Viewers.TryGetValue(__instance, out HashSet<int> viewers))
             {
+                bool dbg = DrokkStorage.config.isDebug;
+
                 // Check if any viewer is closing - if so, skip refresh entirely
                 bool anyViewerClosing = false;
                 foreach (int viewerId in viewers)
@@ -587,13 +599,13 @@ public static class DrokkStoragePatches
                     if (DrokkStoragePatches.viewersClosing.Contains(viewerId))
                     {
                         anyViewerClosing = true;
-                        Log.Out($"[DrokkStorage] SetModified: Viewer {viewerId} is closing, skipping refresh for all viewers");
+                        if (dbg) Log.Out($"[DrokkStorage] SetModified: Viewer {viewerId} is closing, skipping refresh for all viewers");
                         break;
                     }
                 }
-                
+
                 if (anyViewerClosing) return;
-                
+
                 float currentTime = Time.time;
                 List<int> viewersList = viewers.ToList();
                 foreach (int viewerId in viewersList)
@@ -609,13 +621,13 @@ public static class DrokkStoragePatches
                         LocalPlayerUI ui = LocalPlayerUI.GetUIForPlayer(localPlayer);
                         if (ui != null && !ui.windowManager.IsWindowOpen("looting"))
                         {
-                            Log.Out($"[DrokkStorage] SetModified: Host not viewing {__instance}, removing from viewers.");
+                            if (dbg) Log.Out($"[DrokkStorage] SetModified: Host not viewing {__instance}, removing from viewers.");
                             viewers.Remove(viewerId);
                         }
                     }
                     else
                     {
-                        Log.Out($"[DrokkStorage] SetModified detected on server for {__instance}, sending smooth sync to remote viewer {viewerId}");
+                        if (dbg) Log.Out($"[DrokkStorage] SetModified detected on server for {__instance}, sending smooth sync to remote viewer {viewerId}");
                         DrokkStoragePatches.lastProcessedTimes[viewerId] = currentTime;
                         SingletonMonoBehaviour<ConnectionManager>.Instance.SendPackage(
                             NetPackageManager.GetPackage<NetPackageTileEntity>().Setup(__instance, TileEntity.StreamModeWrite.ToClient),
@@ -691,44 +703,44 @@ public static class DrokkStoragePatches
     {
         public static void Prefix(GameManager __instance, int _entityIdThatOpenedIt, ITileEntity _te, string _customUi)
         {
-            Log.Out($"[DrokkStorage] OpenTileEntityUi (OPEN) called: EntityId={_entityIdThatOpenedIt}, TileEntity={_te?.GetType().Name ?? "null"}, Items={DrokkStorage.GetItemCount((TileEntity)_te)}, CustomUi={_customUi ?? "null"}");
-            
+            DrokkStorage.Dbgl($"OpenTileEntityUi (OPEN) called: EntityId={_entityIdThatOpenedIt}, TileEntity={_te?.GetType().Name ?? "null"}, Items={DrokkStorage.GetItemCount((TileEntity)_te)}, CustomUi={_customUi ?? "null"}");
+
             if (SingletonMonoBehaviour<ConnectionManager>.Instance.IsServer && _te is TileEntity tileEntity)
             {
                 if (!Viewers.ContainsKey(tileEntity)) Viewers[tileEntity] = new HashSet<int>();
                 Viewers[tileEntity].Add(_entityIdThatOpenedIt);
                 viewerCustomUi[_entityIdThatOpenedIt] = _customUi ?? "";
-                Log.Out($"[DrokkStorage] Added viewer {_entityIdThatOpenedIt} via OpenTileEntityUi. Total viewers for {tileEntity}: {Viewers[tileEntity].Count}");
+                DrokkStorage.Dbgl($"Added viewer {_entityIdThatOpenedIt} via OpenTileEntityUi. Total viewers for {tileEntity}: {Viewers[tileEntity].Count}");
             }
 
             if (__instance.World != null)
             {
                 EntityPlayerLocal entityPlayerLocal = __instance.World.GetEntity(_entityIdThatOpenedIt) as EntityPlayerLocal;
                 LocalPlayerUI uIForPlayer = LocalPlayerUI.GetUIForPlayer(entityPlayerLocal);
-                
-                Log.Out($"[DrokkStorage] OpenTileEntityUi: EntityPlayerLocal is {(entityPlayerLocal == null ? "NULL" : "VALID")}, LocalPlayerUI is {(uIForPlayer == null ? "NULL" : "VALID")}");
-                
+
+                DrokkStorage.Dbgl($"OpenTileEntityUi: EntityPlayerLocal is {(entityPlayerLocal == null ? "NULL" : "VALID")}, LocalPlayerUI is {(uIForPlayer == null ? "NULL" : "VALID")}");
+
                 if (_te != null)
                 {
                     if (_te.TryGetSelfOrFeature<ITileEntityLootable>(out ITileEntityLootable lootable))
                     {
-                        Log.Out($"[DrokkStorage] OpenTileEntityUi: TileEntity is lootable, container type check will happen");
+                        DrokkStorage.Dbgl("OpenTileEntityUi: TileEntity is lootable, container type check will happen");
                         if (string.IsNullOrEmpty(_customUi))
                         {
-                            Log.Out($"[DrokkStorage] OpenTileEntityUi: Will call lootContainerOpened");
+                            DrokkStorage.Dbgl("OpenTileEntityUi: Will call lootContainerOpened");
                         }
                         else if (_customUi == "container")
                         {
-                            Log.Out($"[DrokkStorage] OpenTileEntityUi: CustomUi='container', will call lootContainerOpened");
+                            DrokkStorage.Dbgl("OpenTileEntityUi: CustomUi='container', will call lootContainerOpened");
                         }
                     }
                 }
             }
         }
-        
+
         public static void Postfix(int _entityIdThatOpenedIt)
         {
-            Log.Out($"[DrokkStorage] OpenTileEntityUi completed for EntityId={_entityIdThatOpenedIt}");
+            DrokkStorage.Dbgl($"OpenTileEntityUi completed for EntityId={_entityIdThatOpenedIt}");
         }
     }
 #endif
@@ -753,6 +765,29 @@ public static class DrokkStoragePatches
 
     private static readonly List<StorageSource> currentSources = new List<StorageSource>();
 
+    // Quadrant-scanning throttle: rather than doing one full-range scan (every loaded chunk +
+    // entity) in a single frame, split the area around the player into 4 quadrants and scan one
+    // per tick, ~250ms apart - same overall scan rate (one full pass/second) but each tick only
+    // pays for ~1/4 of the chunks, so no single frame absorbs the whole cost. This is what was
+    // causing frame drops: GetAllItemCount/GetStorageItems are driven off UI bindings
+    // (havecount, pinned recipe trackers) that can refresh several times a second while a
+    // crafting or quest window is open, and a full-world scan on each refresh was expensive.
+    private static readonly List<StorageSource>[] quadrantSources =
+    {
+        new List<StorageSource>(), new List<StorageSource>(), new List<StorageSource>(), new List<StorageSource>()
+    };
+    private const float QuadrantScanIntervalSeconds = 0.25f;
+    private static Vector3 scanOrigin;
+    private static int nextScanQuadrant = 0;
+    private static float nextScanTime = 0f;
+    private static bool hasCompletedFirstScan = false;
+
+    // 0=+X+Z, 1=-X+Z, 2=+X-Z, 3=-X-Z relative to scanOrigin (fixed for the whole 4-tick cycle).
+    private static int QuadrantOf(Vector3 worldPos)
+    {
+        return (worldPos.x >= scanOrigin.x ? 0 : 1) | (worldPos.z >= scanOrigin.z ? 0 : 2);
+    }
+
     // True if another (living) player currently has this tile entity open. 3.0 removed
     // GameManager.lockedTileEntities; we now answer from the viewer set we maintain off the
     // LockManager flow (TEFeatureStorage.OnLockedServer/OnUnlockedServer above).
@@ -771,20 +806,80 @@ public static class DrokkStoragePatches
         return false;
     }
 
+    // Throttle wrapper: scans one quadrant if the interval has elapsed, otherwise leaves
+    // currentSources as the merge of the last known state of all 4 quadrants (at most ~1s stale).
     private static void ReloadStorages()
     {
         if (!DrokkStorage.config.craftFromContainersEnabled)
             return;
 
-        currentSources.Clear();
         var player = GameManager.Instance.World.GetPrimaryPlayer();
         if (player == null) return;
 
-        var pos = player.position;
+        // Cold start: all 4 quadrant caches are still empty (this mod session has never scanned
+        // before), so the round-robin alone would show an incomplete/empty view of nearby
+        // containers for up to ~750ms - long enough for a crafting window opened right after
+        // spawn to show items as unavailable. Do one synchronous full-area scan up front so the
+        // very first check is always correct, then fall through to the throttled round-robin.
+        if (!hasCompletedFirstScan)
+        {
+            FullRescan(player);
+            return;
+        }
+
+        if (Time.unscaledTime < nextScanTime)
+            return;
+
+        if (nextScanQuadrant == 0)
+            scanOrigin = player.position;
+
+        ScanQuadrant(nextScanQuadrant, player);
+        RebuildCurrentSources();
+
+        nextScanQuadrant = (nextScanQuadrant + 1) % 4;
+        nextScanTime = Time.unscaledTime + QuadrantScanIntervalSeconds;
+    }
+
+    // Synchronously scans all 4 quadrants around the player right now and resets the round-robin
+    // to start fresh from there. Used for the cold-start case above, and called explicitly when a
+    // crafting/recipe window opens (see CraftingWindowGroup_OnOpen_Patch below) - otherwise a
+    // player who walked out of range and back in could see stale/incomplete availability for up
+    // to ~1s (a full round-robin cycle) after reopening the menu, since the cached quadrants still
+    // reflect the old scanOrigin until their next scheduled tick.
+    public static void FullRescan(EntityPlayerLocal player = null)
+    {
+        if (!DrokkStorage.config.craftFromContainersEnabled)
+            return;
+
+        player ??= GameManager.Instance.World?.GetPrimaryPlayer();
+        if (player == null) return;
+
+        scanOrigin = player.position;
+        for (int q = 0; q < 4; q++)
+            ScanQuadrant(q, player);
+
+        RebuildCurrentSources();
+        hasCompletedFirstScan = true;
+        nextScanQuadrant = 0;
+        nextScanTime = Time.unscaledTime + QuadrantScanIntervalSeconds;
+    }
+
+    private static void RebuildCurrentSources()
+    {
+        currentSources.Clear();
+        for (int q = 0; q < 4; q++)
+            currentSources.AddRange(quadrantSources[q]);
+    }
+
+    private static void ScanQuadrant(int quadrant, EntityPlayerLocal player)
+    {
+        var quad = quadrantSources[quadrant];
+        quad.Clear();
+
         var world = GameManager.Instance.World;
         float range = DrokkStorage.config.range;
 
-        DrokkStorage.Dbgl($"ReloadStorages: Scanning for sources near player at {pos}");
+        DrokkStorage.Dbgl($"ReloadStorages: Scanning quadrant {quadrant} near {scanOrigin}");
 
         // --- Tile entities: containers, workstation outputs, dew collectors ---
         // 3.0 collapsed World.ChunkClusters (a list) into the single World.ChunkCache cluster.
@@ -795,6 +890,12 @@ public static class DrokkStoragePatches
             if (cc == null) continue;
             foreach (var c in cc.chunks.dict.Values.ToArray())
             {
+                // Skip chunks outside this tick's quadrant before paying for the tile-entity
+                // dict copy below - that copy is the actual cost being amortized across ticks.
+                var chunkCenter = new Vector3((c.X << 4) + 8, scanOrigin.y, (c.Z << 4) + 8);
+                if (QuadrantOf(chunkCenter) != quadrant)
+                    continue;
+
                 c.EnterReadLock();
                 try
                 {
@@ -806,7 +907,7 @@ public static class DrokkStoragePatches
                         var loc = val.ToWorldPos();
 
                         // Check range
-                        if (range > 0 && Vector3.Distance(pos, loc) > range)
+                        if (range > 0 && Vector3.Distance(scanOrigin, loc) > range)
                             continue;
 
                         // Dew collectors / apiaries (their own item array, no slot locks)
@@ -815,7 +916,7 @@ public static class DrokkStoragePatches
                             if (DrokkStorage.config.pullFromDewCollectors && !collector.bUserAccessing && !IsBeingAccessedByOther(val))
                             {
                                 var col = collector;
-                                currentSources.Add(new StorageSource(col.Items,
+                                quad.Add(new StorageSource(col.Items,
                                     () => { col.SetChunkModified(); col.SetModified(); }, "DewCollector"));
                                 DrokkStorage.Dbgl($"  Added TileEntityCollector at {loc}");
                             }
@@ -829,7 +930,7 @@ public static class DrokkStoragePatches
                                 && workstation.output != null && !IsBeingAccessedByOther(val))
                             {
                                 var ws = workstation;
-                                currentSources.Add(new StorageSource(ws.output,
+                                quad.Add(new StorageSource(ws.output,
                                     () => { ws.SetChunkModified(); ws.SetModified(); }, "Workstation"));
                                 DrokkStorage.Dbgl($"  Added TileEntityWorkstation at {loc}");
                             }
@@ -855,7 +956,7 @@ public static class DrokkStoragePatches
                                         continue;
 
                                     var teComposite = val;
-                                    currentSources.Add(new StorageSource(lootable.items, teComposite.SetModified, "Composite"));
+                                    quad.Add(new StorageSource(lootable.items, teComposite.SetModified, "Composite"));
                                     DrokkStorage.Dbgl($"  Added TileEntityComposite at {loc}");
                                 }
                             }
@@ -874,7 +975,7 @@ public static class DrokkStoragePatches
                                 continue;
 
                             var teSecure = val;
-                            currentSources.Add(new StorageSource(secureLootable.items, teSecure.SetModified, "Loot"));
+                            quad.Add(new StorageSource(secureLootable.items, teSecure.SetModified, "Loot"));
                             DrokkStorage.Dbgl($"  Added non-composite loot container at {loc}");
                         }
                     }
@@ -896,7 +997,9 @@ public static class DrokkStoragePatches
                 {
                     if (entity == null)
                         continue;
-                    if (range > 0 && Vector3.Distance(pos, entity.position) > range)
+                    if (QuadrantOf(entity.position) != quadrant)
+                        continue;
+                    if (range > 0 && Vector3.Distance(scanOrigin, entity.position) > range)
                         continue;
 
                     if (DrokkStorage.config.pullFromVehicles && entity is EntityVehicle vehicle)
@@ -907,7 +1010,7 @@ public static class DrokkStoragePatches
                             && !vehicle.IsLockedForLocalPlayer(player))
                         {
                             var veh = vehicle;
-                            currentSources.Add(new StorageSource(veh.bag.items,
+                            quad.Add(new StorageSource(veh.bag.items,
                                 () => veh.SetBagModified(), "Vehicle"));
                             DrokkStorage.Dbgl($"  Added EntityVehicle {vehicle.entityId}");
                         }
@@ -922,7 +1025,7 @@ public static class DrokkStoragePatches
                             && drone.IsUserAllowed(PlatformManager.InternalLocalUserIdentifier))
                         {
                             var dr = drone;
-                            currentSources.Add(new StorageSource(dl.items, () => dr.SendSyncData(8), "Drone"));
+                            quad.Add(new StorageSource(dl.items, () => dr.SendSyncData(8), "Drone"));
                             DrokkStorage.Dbgl($"  Added EntityDrone {drone.entityId}");
                         }
                     }
@@ -930,7 +1033,7 @@ public static class DrokkStoragePatches
             }
         }
 
-        DrokkStorage.Dbgl($"ReloadStorages: Found {currentSources.Count} accessible sources");
+        DrokkStorage.Dbgl($"ReloadStorages: Quadrant {quadrant} found {quad.Count} accessible sources");
     }
 
     private static List<ItemStack> GetStorageItems()
@@ -1584,7 +1687,44 @@ public static class DrokkStoragePatches
             return codes.AsEnumerable();
         }
     }
-    
+
+    // ItemActionEntryCraft.hasItems() ORs XUiM_PlayerInventory.HasItems (patched above, sees
+    // nearby containers/workstation outputs) with XUiC_WorkstationInputGrid.HasItems (the
+    // campfire/forge's own material slots) to decide if a recipe is craftable. But OnActivated's
+    // removal is an if/else, not both: whenever a workstation input grid is present (campfire,
+    // forge, etc.) it calls ONLY XUiC_WorkstationInputGrid.RemoveItems and never touches
+    // XUiM_PlayerInventory.RemoveItems at all. So an ingredient that's only available via the
+    // mod's storage pull (a nearby chest, or - notably - sitting in that same workstation's own
+    // OUTPUT slot) passes the availability check but is never actually consumed. Patch this grid's
+    // RemoveItems the same way, so any shortfall left after the grid's own DecItem falls through
+    // to DecItem() against currentSources.
+    [HarmonyPatch(typeof(XUiC_WorkstationInputGrid), nameof(XUiC_WorkstationInputGrid.RemoveItems))]
+    public static class XUiC_WorkstationInputGrid_RemoveItems_Patch
+    {
+        public static IEnumerable<CodeInstruction> Transpiler(IEnumerable<CodeInstruction> instructions)
+        {
+            var codes = new List<CodeInstruction>(instructions);
+            int patched = 0;
+            for (int i = 0; i < codes.Count; i++)
+            {
+                if (codes[i].opcode == OpCodes.Call && (MethodInfo)codes[i].operand == AccessTools.Method(typeof(XUiC_WorkstationInputGrid), nameof(XUiC_WorkstationInputGrid.DecItem)))
+                {
+                    var ci = codes[i + 3];
+                    var ciNew = new CodeInstruction(OpCodes.Ldarg_1);
+                    ci.MoveLabelsTo(ciNew);
+                    codes.Insert(i + 3, new CodeInstruction(OpCodes.Call, AccessTools.Method(typeof(DrokkStoragePatches), nameof(DecItemForRemoveItems))));
+                    codes.Insert(i + 3, new CodeInstruction(OpCodes.Ldloc_1));
+                    codes.Insert(i + 3, new CodeInstruction(OpCodes.Ldloc_0));
+                    codes.Insert(i + 3, ciNew);
+                    patched++;
+                    break;
+                }
+            }
+            LogPatchResult("XUiC_WorkstationInputGrid.RemoveItems", patched);
+            return codes.AsEnumerable();
+        }
+    }
+
     [HarmonyPatch(typeof(XUiC_RecipeCraftCount), "calcMaxCraftable")]
     public static class XUiC_RecipeCraftCount_calcMaxCraftable_Patch
     {
@@ -2008,10 +2148,15 @@ public static class DrokkStoragePatches
     }
 #endif
 
-    // 10. Debug NetPackageTileEntity.Setup to see when data is SENT
+    // 10. Debug NetPackageTileEntity.Setup to see when data is SENT. Pure logging, no other
+    // side effect, so Prepare() skips installing this patch entirely when debug is off - this
+    // fires on every tile-entity sync packet, so an uninstalled patch (vs. a per-call flag
+    // check) avoids even the Harmony dispatch overhead.
     [HarmonyPatch(typeof(NetPackageTileEntity), nameof(NetPackageTileEntity.Setup), new Type[] { typeof(TileEntity), typeof(TileEntity.StreamModeWrite) })]
     public static class NetPackageTileEntity_Setup_Patch
     {
+        public static bool Prepare() => DrokkStorage.config.isDebug;
+
         public static void Postfix(TileEntity _te, TileEntity.StreamModeWrite _eStreamMode)
         {
             bool isServer = SingletonMonoBehaviour<ConnectionManager>.Instance.IsServer;
@@ -2036,17 +2181,20 @@ public static class DrokkStoragePatches
                     if (DrokkStorage.IsQuestContainer(parent))
                     {
                         wasUserAccessing = false;
-                        Log.Out($"[DrokkStorage] TEFeatureStorage.Read (RECEIVE): QUEST container {parent}, skipping bUserAccessing bypass (vanilla handling).");
+                        if (DrokkStorage.config.isDebug)
+                            Log.Out($"[DrokkStorage] TEFeatureStorage.Read (RECEIVE): QUEST container {parent}, skipping bUserAccessing bypass (vanilla handling).");
                         return;
                     }
 
                     wasUserAccessing = parent.IsUserAccessing();
                     if (wasUserAccessing)
                     {
-                        Log.Out($"[DrokkStorage] TEFeatureStorage.Read (RECEIVE): WINDOW OPEN. Temporarily setting bUserAccessing to false for COMPOSITE TE {parent} to allow update.");
+                        if (DrokkStorage.config.isDebug)
+                            Log.Out($"[DrokkStorage] TEFeatureStorage.Read (RECEIVE): WINDOW OPEN. Temporarily setting bUserAccessing to false for COMPOSITE TE {parent} to allow update.");
                         parent.SetUserAccessing(false);
                     }
-                    Log.Out($"[DrokkStorage] TEFeatureStorage.Read (RECEIVE) PREFIX: Parent={parent}, ItemsBefore={DrokkStorage.GetItemCount(parent)}");
+                    if (DrokkStorage.config.isDebug)
+                        Log.Out($"[DrokkStorage] TEFeatureStorage.Read (RECEIVE) PREFIX: Parent={parent}, ItemsBefore={DrokkStorage.GetItemCount(parent)}");
                 }
             }
         }
@@ -2058,10 +2206,12 @@ public static class DrokkStoragePatches
                 TileEntity parent = __instance.Parent;
                 if (parent != null)
                 {
-                    Log.Out($"[DrokkStorage] TEFeatureStorage.Read (RECEIVE) POSTFIX: Parent={parent}, ItemsAfter={DrokkStorage.GetItemCount(parent)}");
+                    if (DrokkStorage.config.isDebug)
+                        Log.Out($"[DrokkStorage] TEFeatureStorage.Read (RECEIVE) POSTFIX: Parent={parent}, ItemsAfter={DrokkStorage.GetItemCount(parent)}");
                     if (wasUserAccessing)
                     {
-                        Log.Out($"[DrokkStorage] TEFeatureStorage.Read (RECEIVE): Restoring bUserAccessing to true for COMPOSITE TE {parent}");
+                        if (DrokkStorage.config.isDebug)
+                            Log.Out($"[DrokkStorage] TEFeatureStorage.Read (RECEIVE): Restoring bUserAccessing to true for COMPOSITE TE {parent}");
                         parent.SetUserAccessing(true);
                         wasUserAccessing = false;
                     }
@@ -2139,6 +2289,29 @@ public static class DrokkStoragePatches
         public static void Postfix()
         {
             UpdateUI();
+        }
+    }
+
+    // Force an immediate full rescan of nearby containers whenever a crafting-capable window
+    // opens, rather than waiting on the throttled round-robin. Without this, walking out of
+    // range and back in and reopening the menu could show stale availability from the old
+    // scanOrigin for up to ~1s (one full quadrant cycle). XUiC_WorkstationWindowGroup overrides
+    // OnOpen entirely (doesn't call base), so both need their own patch.
+    [HarmonyPatch(typeof(XUiC_CraftingWindowGroup), nameof(XUiC_CraftingWindowGroup.OnOpen))]
+    public static class CraftingWindowGroup_OnOpen_Patch
+    {
+        public static void Postfix()
+        {
+            FullRescan();
+        }
+    }
+
+    [HarmonyPatch(typeof(XUiC_WorkstationWindowGroup), nameof(XUiC_WorkstationWindowGroup.OnOpen))]
+    public static class WorkstationWindowGroup_OnOpen_Patch
+    {
+        public static void Postfix()
+        {
+            FullRescan();
         }
     }
 
