@@ -1,6 +1,6 @@
 <Project Sdk="Microsoft.NET.Sdk">
   <PropertyGroup>
-    <Version>1.0.3</Version>
+    <Version>1.0.4</Version>
     <AssemblyName>DrokkStorage</AssemblyName>
     <RootNamespace>DrokkStorage</RootNamespace>
     <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
@@ -10,5 +10,14 @@
     <None Update="ModInfo.xml">
       <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
     </None>
+  </ItemGroup>
+
+  <!-- Needed by DrokkModUpdateChecker.cs. If you copy that file into another mod, add this
+       reference to that mod's .csproj too. -->
+  <ItemGroup>
+    <Reference Include="UnityEngine.UnityWebRequestModule">
+      <HintPath>$(ManagedDataPath)\UnityEngine.UnityWebRequestModule.dll</HintPath>
+      <Private>False</Private>
+    </Reference>
   </ItemGroup>
 </Project>

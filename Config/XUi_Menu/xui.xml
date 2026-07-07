@@ -1,0 +1,13 @@
+<configs>
+
+    <!-- Update-available popup shown over the main menu (DrokkModUpdateChecker.cs). Its own
+         window_group rather than reusing the shared messageBox, because the shared one lays
+         out its button row centered via a <table> and has no room for our "check for
+         updates" toggle. -->
+    <append xpath="/xui">
+        <window_group name="DrokkUpdateNotice">
+            <window name="windowDrokkUpdateNotice" />
+        </window_group>
+    </append>
+
+</configs>

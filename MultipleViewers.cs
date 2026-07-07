@@ -62,6 +62,7 @@ public class DrokkStorage : IModApi
         LoadConfig(_modInstance);
         var harmony = new Harmony(GetType().ToString());
         harmony.PatchAll(Assembly.GetExecutingAssembly());
+        DrokkModUpdateChecker.Register(_modInstance);
 
         // Register custom packages with NetPackageManager
         try
@@ -290,6 +291,45 @@ public static class DrokkStoragePatches
     private static readonly Dictionary<int, string> viewerCustomUi = new Dictionary<int, string>();
     // Track viewers that are closing (to avoid refresh on close)
     private static readonly HashSet<int> viewersClosing = new HashSet<int>();
+
+    // QUICKSTACK/QUICKRESTOCK DUPE GUARD: NetPackageFindOpenableContainers.ProcessPackage computes
+    // "which containers are currently openable" on the server, then sends that list to the
+    // *requesting client*, which executes the actual item move locally and syncs the result back -
+    // a full network round trip. Without this, two players clicking QuickStack/QuickRestock on the
+    // same container within that round trip both get told the container is available, both pull the
+    // same stacks locally, and both writes land - duplicating items. Reserving every position handed
+    // out to a client closes that window: a second player's request within the reservation period is
+    // filtered out by FindNearbyLootContainers before it's ever sent back to them.
+    private static readonly Dictionary<Vector3i, (int PlayerId, float ExpiresAt)> quickMoveReservations = new Dictionary<Vector3i, (int, float)>();
+    private const float QuickMoveReservationSeconds = 3.0f;
+
+    private static void PurgeExpiredReservations()
+    {
+        if (quickMoveReservations.Count == 0) return;
+        float now = Time.time;
+        List<Vector3i> expired = null;
+        foreach (var kvp in quickMoveReservations)
+        {
+            if (kvp.Value.ExpiresAt <= now)
+                (expired ?? (expired = new List<Vector3i>())).Add(kvp.Key);
+        }
+        if (expired != null)
+            foreach (var pos in expired) quickMoveReservations.Remove(pos);
+    }
+
+    public static bool IsReservedByOther(Vector3i pos, int playerEntityId)
+    {
+        PurgeExpiredReservations();
+        return quickMoveReservations.TryGetValue(pos, out var existing)
+            && existing.PlayerId != playerEntityId
+            && existing.ExpiresAt > Time.time;
+    }
+
+    public static void ReserveForQuickMove(Vector3i pos, int playerEntityId)
+    {
+        PurgeExpiredReservations();
+        quickMoveReservations[pos] = (playerEntityId, Time.time + QuickMoveReservationSeconds);
+    }
 
     // QuickStack state
     public static float[] lastClickTimes = new float[(int)QuickStackType.Count];
@@ -791,14 +831,16 @@ public static class DrokkStoragePatches
     // True if another (living) player currently has this tile entity open. 3.0 removed
     // GameManager.lockedTileEntities; we now answer from the viewer set we maintain off the
     // LockManager flow (TEFeatureStorage.OnLockedServer/OnUnlockedServer above).
-    private static bool IsBeingAccessedByOther(TileEntity te)
+    // Excludes the requesting player themselves - takes their id explicitly rather than assuming
+    // GetPrimaryPlayerId(), which is only correct for the host and is meaningless on a dedicated
+    // server, silently disabling this guard for every remote client.
+    private static bool IsBeingAccessedByOther(TileEntity te, int requestingPlayerId)
     {
         if (te != null && Viewers.TryGetValue(te, out HashSet<int> viewers))
         {
-            int meId = GameManager.Instance.World.GetPrimaryPlayerId();
             foreach (int id in viewers)
             {
-                if (id == meId) continue;
+                if (id == requestingPlayerId) continue;
                 if (GameManager.Instance.World.GetEntity(id) is EntityAlive ea && !ea.IsDead())
                     return true;
             }
@@ -913,7 +955,7 @@ public static class DrokkStoragePatches
                         // Dew collectors / apiaries (their own item array, no slot locks)
                         if (val is TileEntityCollector collector)
                         {
-                            if (DrokkStorage.config.pullFromDewCollectors && !collector.bUserAccessing && !IsBeingAccessedByOther(val))
+                            if (DrokkStorage.config.pullFromDewCollectors && !collector.bUserAccessing && !IsBeingAccessedByOther(val, player.entityId))
                             {
                                 var col = collector;
                                 quad.Add(new StorageSource(col.Items,
@@ -927,7 +969,7 @@ public static class DrokkStoragePatches
                         if (val is TileEntityWorkstation workstation)
                         {
                             if (DrokkStorage.config.pullFromWorkstationOutputs && workstation.IsPlayerPlaced
-                                && workstation.output != null && !IsBeingAccessedByOther(val))
+                                && workstation.output != null && !IsBeingAccessedByOther(val, player.entityId))
                             {
                                 var ws = workstation;
                                 quad.Add(new StorageSource(ws.output,
@@ -952,7 +994,7 @@ public static class DrokkStoragePatches
                                 if (lockable == null || !lockable.IsLocked() ||
                                     (DrokkStorage.config.allowLockedContainers && lockable.IsUserAllowed(PlatformManager.InternalLocalUserIdentifier)))
                                 {
-                                    if (IsBeingAccessedByOther(val))
+                                    if (IsBeingAccessedByOther(val, player.entityId))
                                         continue;
 
                                     var teComposite = val;
@@ -971,7 +1013,7 @@ public static class DrokkStoragePatches
                             if (val is ILockable lockable2 && lockable2.IsLocked() && !lockable2.IsUserAllowed(PlatformManager.InternalLocalUserIdentifier))
                                 continue;
 
-                            if (IsBeingAccessedByOther(val))
+                            if (IsBeingAccessedByOther(val, player.entityId))
                                 continue;
 
                             var teSecure = val;
@@ -1294,7 +1336,7 @@ public static class DrokkStoragePatches
             // Skip containers another living player currently has open (avoids racing their live
             // QuickStack edits). 3.0 removed GameManager.lockedTileEntities, so this now reads from
             // the viewer set maintained off the LockManager flow.
-            if (IsBeingAccessedByOther(_tileEntity))
+            if (IsBeingAccessedByOther(_tileEntity, _entityIdThatOpenedIt))
                 return false;
 
             return true;
@@ -1366,12 +1408,19 @@ public static class DrokkStoragePatches
                 for (int k = -DrokkStorage.config.stashDistance.z; k <= DrokkStorage.config.stashDistance.z; k++)
                 {
                     var offset = new Vector3i(i, j, k);
-                    var val = GetInventoryFromBlockPosition(_center + offset);
+                    var pos = _center + offset;
+                    var val = GetInventoryFromBlockPosition(pos);
 
                     if (val.Item1 == null)
                         continue;
 
                     if (!IsContainerUnlocked(_playerEntityId, val.Item2))
+                        continue;
+
+                    // Another player's QuickStack/QuickRestock request is already in flight for
+                    // this container - skip it until their round trip completes or the reservation
+                    // expires, rather than letting both players pull the same items.
+                    if (IsReservedByOther(pos, _playerEntityId))
                         continue;
 
                     yield return new ValueTuple<Vector3i, TileEntity>(offset, val.Item2);
@@ -1400,6 +1449,39 @@ public static class DrokkStoragePatches
         }
     }
 
+    // QuickStack/QuickRestock move many stacks in one call, and every stack XUiM_LootContainer.StashItems
+    // touches fires its own TileEntity.SetModified() (once via TryStackItem, once via AddItem/UpdateSlot,
+    // or once per slot through XUiC_LootContainer.HandleLootSlotChangedEvent). On a remote (non-host)
+    // client each of those is a separate handle-tagged NetPackageTileEntity sent to the server, and the
+    // server echoes each one back to every client - including the sender. Those echoes can arrive back
+    // out of order relative to the client's own later, more-complete local writes; if the client's local
+    // TileEntity gets rolled back to an earlier (less-complete) snapshot by a stale echo and then something
+    // fires SetModified() on it again (this code already did, redundantly, right after StashItems), the
+    // client re-sends that stale snapshot to the server - resurrecting items that were already removed and
+    // already handed to the player. That's the "took a stack of stuff, item ended up in inventory AND back
+    // in the container" dupe. Fix: suppress every in-loop SetModified with SetDisableModifiedCheck while
+    // StashItems runs, then send exactly one push of the fully-resolved final state - mirroring how
+    // vanilla's own TakeAll() does a single batched model update instead of one write per slot.
+    private static void RunBatchedStash(TileEntity containerTe, Action stashAction)
+    {
+        int before = DrokkStorage.GetItemCount(containerTe);
+        containerTe.SetDisableModifiedCheck(true);
+        try
+        {
+            stashAction();
+        }
+        finally
+        {
+            containerTe.SetDisableModifiedCheck(false);
+        }
+        containerTe.SetModified();
+        if (DrokkStorage.config.isDebug)
+        {
+            int after = DrokkStorage.GetItemCount(containerTe);
+            Log.Out($"[DrokkStorage] RunBatchedStash: {containerTe} ItemsBefore={before} ItemsAfter={after} (single batched SetModified sent)");
+        }
+    }
+
     public static void MoveQuickStack()
     {
         try
@@ -1416,8 +1498,8 @@ public static class DrokkStoragePatches
             {
                 if (pair.Item2.TryGetSelfOrFeature<ITileEntityLootable>(out var lootable))
                 {
-                    XUiM_LootContainer.StashItems(backpackWindow, playerBackpack, lootable, 0, playerControls.LockedSlots, moveKind, playerControls.MoveStartBottomRight);
-                    pair.Item2.SetModified();
+                    RunBatchedStash(pair.Item2, () =>
+                        XUiM_LootContainer.StashItems(backpackWindow, playerBackpack, lootable, 0, playerControls.LockedSlots, moveKind, playerControls.MoveStartBottomRight));
                 }
             }
         }
@@ -1445,8 +1527,8 @@ public static class DrokkStoragePatches
                 if (val.Item1 == null)
                     continue;
 
-                XUiM_LootContainer.StashItems(backpackWindow, playerBackpack, val.Item1, 0, playerControls.LockedSlots, moveKind, playerControls.MoveStartBottomRight);
-                val.Item2.SetModified();
+                RunBatchedStash(val.Item2, () =>
+                    XUiM_LootContainer.StashItems(backpackWindow, playerBackpack, val.Item1, 0, playerControls.LockedSlots, moveKind, playerControls.MoveStartBottomRight));
             }
         }
         catch (Exception e)
@@ -1475,8 +1557,8 @@ public static class DrokkStoragePatches
                 {
                     lootWindowGroup.lootWindow.SetTileEntityChest("QUICKSTACK", lootable);
                     PackedBoolArray lockedSlots = new PackedBoolArray(lootWindowGroup.lootWindow.lootContainer.items.Length);
-                    XUiM_LootContainer.StashItems(backpackWindow, lootWindowGroup.lootWindow.lootContainer, playerUI.mXUi.PlayerInventory, 0, lockedSlots, moveKind, playerControls.MoveStartBottomRight);
-                    pair.Item2.SetModified();
+                    RunBatchedStash(pair.Item2, () =>
+                        XUiM_LootContainer.StashItems(backpackWindow, lootWindowGroup.lootWindow.lootContainer, playerUI.mXUi.PlayerInventory, 0, lockedSlots, moveKind, playerControls.MoveStartBottomRight));
                 }
             }
         }
@@ -1510,8 +1592,8 @@ public static class DrokkStoragePatches
 
                 lootWindowGroup.lootWindow.SetTileEntityChest("QUICKSTACK", val.Item1);
                 PackedBoolArray lockedSlots = new PackedBoolArray(lootWindowGroup.lootWindow.lootContainer.items.Length);
-                XUiM_LootContainer.StashItems(backpackWindow, lootWindowGroup.lootWindow.lootContainer, playerUI.mXUi.PlayerInventory, 0, lockedSlots, moveKind, playerControls.MoveStartBottomRight);
-                val.Item2.SetModified();
+                RunBatchedStash(val.Item2, () =>
+                    XUiM_LootContainer.StashItems(backpackWindow, lootWindowGroup.lootWindow.lootContainer, playerUI.mXUi.PlayerInventory, 0, lockedSlots, moveKind, playerControls.MoveStartBottomRight));
             }
         }
         catch (Exception e)
@@ -2183,6 +2265,28 @@ public static class DrokkStoragePatches
                         wasUserAccessing = false;
                         if (DrokkStorage.config.isDebug)
                             Log.Out($"[DrokkStorage] TEFeatureStorage.Read (RECEIVE): QUEST container {parent}, skipping bUserAccessing bypass (vanilla handling).");
+                        return;
+                    }
+
+                    // ECHO GUARD: never bypass while WE have un-acked writes in flight to the
+                    // server. A bulk move (vanilla Take All / stash-all, or QuickStack) fires one
+                    // SetModified per slot; the server applies each and echoes every intermediate
+                    // state back to ALL clients, including us. Vanilla protects the sender by
+                    // discarding incoming item data while IsUserAccessing() is true
+                    // (TEFeatureStorage.Read reads into a dummy stack) - our bypass below defeated
+                    // that, letting stale echoes roll our open window back to an earlier state,
+                    // which the window-close sync then pushed back to the server = item dupe.
+                    // bWaitingForServerResponse is vanilla's own in-flight marker: set on every
+                    // client-side setModified(), cleared by SetHandle() only when the echo of our
+                    // LATEST write arrives (and SetHandle runs before Read in ProcessPackage), so
+                    // stale echoes are discarded and the final, consistent echo still applies.
+                    // Other viewers' updates arriving during that brief window are dropped too,
+                    // but the next sync after our writes settle delivers the merged server state.
+                    if (parent.bWaitingForServerResponse)
+                    {
+                        wasUserAccessing = false;
+                        if (DrokkStorage.config.isDebug)
+                            Log.Out($"[DrokkStorage] TEFeatureStorage.Read (RECEIVE): STALE ECHO of our own pending write for {parent} (bWaitingForServerResponse), skipping bUserAccessing bypass so vanilla discards it.");
                         return;
                     }
 

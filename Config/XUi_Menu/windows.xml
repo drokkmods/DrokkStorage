@@ -1,0 +1,45 @@
+<configs>
+
+    <!-- Update-available popup (XUiC_DrokkUpdateNotice). Message text and the "Check for
+         updates" toggle's checked state are both driven from code in OnOpen(), so the XML
+         here stays static. Chrome modelled on the vanilla panel look used elsewhere in
+         Drokk mods (DrokkTravel's windowDrokkJoinPocket). -->
+    <append xpath="/windows">
+        <!-- Positioned to float directly below the vanilla news/featured boxes in the main
+             menu's top-right corner (mainMenuNews: anchor="Top" pos="870,-40" width~670,
+             height 253 → bottom edge at y=-293). Right-aligned to the same x=870 edge so it
+             reads as an extension of those boxes rather than an interrupting popup, and opened
+             non-modally (see Show()) so it never blocks the main menu underneath it. -->
+        <window name="windowDrokkUpdateNotice" anchor="Top" pos="310,-303" width="560" height="280"
+                controller="XUiC_DrokkUpdateNotice, DrokkStorage" cursor_area="true">
+
+            <!-- Single panel spanning the full window (header included) so the gray background
+                 sits behind the title as well, instead of the title having its own separate
+                 ui_game_panel_header sprite. -->
+            <panel name="content" pos="0,0" height="280" depth="1" disableautobackground="true">
+                <sprite depth="6" name="border" sprite="menu_empty3px" pos="0,0" width="560" height="280"
+                        color="[black]" type="sliced" fillcenter="false" globalopacity="true" globalopacitymod="0.9" />
+                <sprite depth="1" name="bg" sprite="menu_empty3px" pos="2,-2" width="556" height="276"
+                        color="45,45,45,255" type="sliced" fillcenter="true" />
+
+                <label style="header.name" pos="8,-6" text="Drokk Mod Updates" depth="3" />
+
+                <rect name="messageArea" pos="14,-62" width="532" height="160" depth="3"
+                      on_scroll="true" gamepad_selectable="true" snap="false">
+                    <defaultscrollbar />
+                    <scrollview name="messageScroll" pos="0,0" width="512" clippingsoftness="0,10">
+                        <label name="message" depth="3" width="512" pivot="topleft" justify="left"
+                               font_size="22" color="225,225,225,255" upper_case="false"
+                               support_urls="HTTP" text="" overflow="resizeheight" />
+                    </scrollview>
+                </rect>
+
+                <togglebutton name="cbxCheckUpdates" caption="Check for updates" pos="12,-238"
+                              width="300" height="32" depth="3" font_size="20" toggle_value="true" />
+                <simplebutton name="btnOk" caption="OK" pos="450,-238" width="100" height="32" depth="3" />
+            </panel>
+
+        </window>
+    </append>
+
+</configs>

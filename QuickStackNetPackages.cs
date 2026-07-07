@@ -240,6 +240,10 @@ public class NetPackageFindOpenableContainers : NetPackage
             foreach (var pair in DrokkStoragePatches.FindNearbyLootContainers(center, playerEntityId))
             {
                 openableEntities.Add(pair.Item1);
+                // Reserve immediately: the client executes the actual move after this packet
+                // round-trips back to them, so another player's request in that window must not
+                // also see this container as available (see quickMoveReservations).
+                DrokkStoragePatches.ReserveForQuickMove(center + pair.Item1, playerEntityId);
             }
 
             var cinfo = ConnectionManager.Instance.Clients.ForEntityId(playerEntityId);
