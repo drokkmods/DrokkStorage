@@ -7,9 +7,12 @@ using HarmonyLib;
 using Newtonsoft.Json.Linq;
 using UnityEngine.Networking;
 
-// Shared "check drokkmods.fyi for updates" popup. Copy this file verbatim into any other
-// Drokk mod to opt it in — just call DrokkModUpdateChecker.Register(_modInstance) once from
-// that mod's InitMod. Every copy registers its own mod name/version into one shared,
+// Shared "check drokkmods.fyi for updates" popup. Lives in mods/_Shared/ and is symlinked into
+// each mod that opts in (see mods/_Shared/README.md) — edit it HERE, once. A mod opts in by
+// symlinking this file plus XUiC_DrokkUpdateNotice.cs and calling
+// DrokkModUpdateChecker.Register(_modInstance) once from its InitMod. It still compiles into
+// each assembly separately, so the cross-assembly bookkeeping below is still required.
+// Every copy registers its own mod name/version into one shared,
 // AppDomain-wide list; only the first copy to run actually installs the Harmony patch and
 // fires the request, and its popup reports on every Drokk mod that registered (whether that
 // mod loaded before or after the patch went in). Uses a fixed HarmonyId so
@@ -18,8 +21,12 @@ using UnityEngine.Networking;
 public static class DrokkModUpdateChecker
 {
     private const string HarmonyId = "drokk.updatechecker";
-    private const string UpdateUrl = "https://drokkmods.fyi/api/updates";
+    // Host comes from DrokkApi so -staging redirects this (and every other Drokk API
+    // call) to the staging backend in one place.
+    private const string UpdatePath = "/api/updates";
     private const int TimeoutSeconds = 5;
+    // Query cap, well under the ~8 KB request line most proxies accept.
+    private const int MaxUrlLength = 6000;
     private const string AppDomainKey = "DrokkModUpdateChecker.RegisteredMods";
     private const string SettingsFileName = "drokk.json";
 
@@ -126,7 +133,7 @@ public static class DrokkModUpdateChecker
 
     private static IEnumerator CheckForUpdates(XUiC_MainMenu mainMenu)
     {
-        string url = BuildUrl(GetRegisteredMods());
+        string url = BuildUrl(CollectInstalledMods());
 
         using (var req = UnityWebRequest.Get(url))
         {
@@ -148,14 +155,56 @@ public static class DrokkModUpdateChecker
         }
     }
 
+    // EVERY mod the player has loaded, not just the Drokk ones that called Register() - the
+    // server wants the whole load order to reason about conflicts and compatibility, and a
+    // Drokk mod that predates this checker (or never symlinked it) would otherwise be
+    // invisible. Registered mods are unioned in afterwards as a safety net: they are all in
+    // ModManager already, but a registration that arrives from somewhere unusual should still
+    // be reported rather than silently dropped.
+    private static Dictionary<string, string> CollectInstalledMods()
+    {
+        var mods = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+        try
+        {
+            foreach (var mod in ModManager.GetLoadedMods())
+            {
+                if (mod == null || string.IsNullOrEmpty(mod.Name)) continue;
+                mods[mod.Name] = mod.VersionString ?? "";
+            }
+        }
+        catch (Exception e)
+        {
+            Log.Warning($" [DrokkModUpdateChecker] Could not enumerate installed mods: {e.Message}");
+        }
+
+        foreach (var kv in GetRegisteredMods())
+        {
+            mods[kv.Key] = kv.Value;
+        }
+        return mods;
+    }
+
     private static string BuildUrl(Dictionary<string, string> mods)
     {
-        var sb = new StringBuilder(UpdateUrl);
+        var sb = new StringBuilder(DrokkApi.Url(UpdatePath));
         sb.Append("?game_version=").Append(Uri.EscapeDataString(Constants.cVersionInformation.SerializableString));
+
+        int sent = 0;
         foreach (var kv in mods)
         {
+            // A player with a very large mod folder can otherwise build a query long enough
+            // for a proxy to reject outright, which would read as "update check timed out"
+            // and lose the popup entirely. Better to report most of the list than none of it.
+            if (sb.Length > MaxUrlLength)
+            {
+                Log.Warning($" [DrokkModUpdateChecker] Mod list too long for one URL; reported {sent} of {mods.Count} installed mods.");
+                break;
+            }
             sb.Append("&mod=").Append(Uri.EscapeDataString(kv.Key)).Append(':').Append(Uri.EscapeDataString(kv.Value));
+            sent++;
         }
+
+        Log.Out($" [DrokkModUpdateChecker] Reporting {sent} installed mod(s) to {DrokkApi.BaseUrl}.");
         return sb.ToString();
     }
 

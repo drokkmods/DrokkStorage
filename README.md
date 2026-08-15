@@ -1,14 +1,14 @@
 # Drokk Storage
 
-Allows multiple players to view storage containers and workbenches simultaneously.
+Everyone can open the same container, workbench or forge at the same time. Includes Quick Stack and Craft/Repair from containers too.
 
 **Author:** drokk
-**Version:** 1.0.4
+**Version:** 1.0.5
 A mod for *7 Days to Die*.
 
 ## Install (no compiling needed)
 
-1. Download `DrokkStorage-v1.0.4.zip` from the [latest release](https://github.com/drokkmods/DrokkStorage/releases/latest).
+1. Download `DrokkStorage-v1.0.5.zip` from the [latest release](https://github.com/drokkmods/DrokkStorage/releases/latest).
 2. Extract it into your `7 Days To Die/Mods/` folder so you end up with `Mods/DrokkStorage/`.
 3. Launch the game. On multiplayer, the server and all clients need the mod.
 

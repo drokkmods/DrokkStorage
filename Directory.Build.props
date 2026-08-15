@@ -1,5 +1,7 @@
 <Project>
   <PropertyGroup>
+    <!-- bin_local, not bin: bin is a symlink to the RAM runtime copy, which is empty
+         after a reboot until scripts/ram_deploy.sh runs (compile happens first). -->
     <GamePath Condition="'$(GamePath)'==''">$(MSBuildThisFileDirectory)game</GamePath>
     <ManagedDataPath>$(GamePath)/7DaysToDie_Data/Managed</ManagedDataPath>
     <HarmonyPath>$(GamePath)/Mods/0_TFP_Harmony</HarmonyPath>
@@ -132,6 +134,12 @@
     </Reference>
 
     <!-- Networking -->
+    <!-- UnityWebRequestModule is here, not per-mod: _Shared/DrokkModUpdateChecker.cs is
+         symlinked into every mod, so every mod needs it to compile. -->
+    <Reference Include="UnityEngine.UnityWebRequestModule">
+      <HintPath>$(ManagedDataPath)\UnityEngine.UnityWebRequestModule.dll</HintPath>
+      <Private>False</Private>
+    </Reference>
     <Reference Include="LiteNetLib">
       <HintPath>$(ManagedDataPath)\LiteNetLib.dll</HintPath>
       <Private>False</Private>

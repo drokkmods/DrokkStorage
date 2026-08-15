@@ -9,6 +9,14 @@ using Platform;
 using UnityEngine;
 using UnityEngine.Scripting;
 
+// In multiplayer every gameplay setting in here is owned by the SERVER: its values are pushed to
+// each client as they spawn (NetPackageDrokkStorageConfig / DrokkStorageConfigSyncOnSpawn) and
+// overwrite whatever that client's own Config/settings.xml said. Most of this mod's enforcement
+// runs client-side, so without that push an admin's server-side settings.xml would have no effect
+// on connected players and a player could re-enable a disabled feature by editing their own copy.
+// The exceptions - isDebug, lockModeIconVisible, liveRecipeTracking, hotkeys and colours - are
+// per-machine preferences and stay local. Add new settings to the packet unless they're in that
+// group.
 public class DrokkStorageConfig
 {
     public bool craftFromContainersEnabled = true;
@@ -18,6 +26,13 @@ public class DrokkStorageConfig
     public bool enableForReload = true;
     public bool enableForRefuel = true;
     public bool isDebug = false;
+
+    // Restrict every automated bulk item move (QuickStack, QuickRestock, and the
+    // craft/repair/reload/refuel pull) to containers this player actually owns. Off by default -
+    // turning it on is what stops shared-base players stacking into each other's crates.
+    // Strict "owner only": keypad-allowed users and party allies do NOT count, and containers
+    // with no recorded owner (POI loot, debug/creative-placed) are excluded outright.
+    public bool checkOwnership = false;
 
     // Multiple players viewing/modifying the same container at once. In 3.0 this is achieved by
     // marking storage containers as SHARED locks in the engine's LockManager (see the
@@ -86,6 +101,12 @@ public class DrokkStorage : IModApi
                 knownPackageTypes.Add(typeof(NetPackageFindOpenableContainers).Name, typeof(NetPackageFindOpenableContainers));
                 Log.Out(" [DrokkStorage] Registered NetPackageFindOpenableContainers");
             }
+
+            if (!knownPackageTypes.ContainsKey(typeof(NetPackageDrokkStorageConfig).Name))
+            {
+                knownPackageTypes.Add(typeof(NetPackageDrokkStorageConfig).Name, typeof(NetPackageDrokkStorageConfig));
+                Log.Out(" [DrokkStorage] Registered NetPackageDrokkStorageConfig");
+            }
         }
         catch (Exception e)
         {
@@ -131,6 +152,7 @@ public class DrokkStorage : IModApi
             LoadBool(doc, "EnableForReload", v => config.enableForReload = v);
             LoadBool(doc, "EnableForRefuel", v => config.enableForRefuel = v);
             LoadBool(doc, "AllowLockedContainers", v => config.allowLockedContainers = v);
+            LoadBool(doc, "CheckOwnership", v => config.checkOwnership = v);
             LoadBool(doc, "MultiViewersEnabled", v => config.multiViewersEnabled = v);
             LoadBool(doc, "PullFromVehicles", v => config.pullFromVehicles = v);
             LoadBool(doc, "PullFromDrones", v => config.pullFromDrones = v);
@@ -143,7 +165,7 @@ public class DrokkStorage : IModApi
             Log.Out($" [DrokkStorage] Loaded config: ContainerRange={config.range}, QuickStackDistance={config.stashDistance.x}, "
                 + $"CraftFromContainersEnabled={config.craftFromContainersEnabled}, EnableForReload={config.enableForReload}, "
                 + $"EnableForRepairAndUpgrade={config.enableForRepairAndUpgrade}, EnableForRefuel={config.enableForRefuel}, "
-                + $"Debug={config.isDebug}");
+                + $"CheckOwnership={config.checkOwnership}, Debug={config.isDebug}");
         }
         catch (Exception e)
         {
@@ -792,12 +814,23 @@ public static class DrokkStoragePatches
     // containers, vehicles, drones, workstation outputs and dew collectors behind one model.
     private sealed class StorageSource
     {
-        public readonly ItemStack[] Items;
+        private readonly Func<ItemStack[]> itemsProvider;
         public readonly Action MarkModified;
         public readonly string DebugName;
-        public StorageSource(ItemStack[] items, Action markModified, string debugName)
+
+        // Resolved on every access rather than captured once. Several of the backing objects
+        // REPLACE their array instead of mutating it - TileEntityWorkstation.Output/Input assign
+        // ItemStack.Clone(value), and TileEntity.readItemStackArray reallocates whenever an
+        // incoming net payload has a different length. A source captured at scan time is held for
+        // up to a second by the quadrant cache, so it can end up pointing at an orphaned array:
+        // GetAllItemCount still sees the items (it reads the same stale array), the craft is
+        // allowed, and DecItem writes the decrement into an array nobody owns any more. Nothing is
+        // consumed - that's a dupe.
+        public ItemStack[] Items => itemsProvider();
+
+        public StorageSource(Func<ItemStack[]> items, Action markModified, string debugName)
         {
-            Items = items;
+            itemsProvider = items;
             MarkModified = markModified;
             DebugName = debugName;
         }
@@ -921,6 +954,13 @@ public static class DrokkStoragePatches
         var world = GameManager.Instance.World;
         float range = DrokkStorage.config.range;
 
+        // Local player's persistent identity, resolved once per quadrant rather than per tile
+        // entity. GetPersistentLocalPlayer() is the client-safe accessor (the persistent player
+        // *list* is server-side); it's what the engine's own block-ownership UI checks use.
+        PersistentPlayerData localPpd = DrokkStorage.config.checkOwnership
+            ? GameManager.Instance.GetPersistentLocalPlayer()
+            : null;
+
         DrokkStorage.Dbgl($"ReloadStorages: Scanning quadrant {quadrant} near {scanOrigin}");
 
         // --- Tile entities: containers, workstation outputs, dew collectors ---
@@ -955,10 +995,11 @@ public static class DrokkStoragePatches
                         // Dew collectors / apiaries (their own item array, no slot locks)
                         if (val is TileEntityCollector collector)
                         {
-                            if (DrokkStorage.config.pullFromDewCollectors && !collector.bUserAccessing && !IsBeingAccessedByOther(val, player.entityId))
+                            if (DrokkStorage.config.pullFromDewCollectors && !collector.bUserAccessing && !IsBeingAccessedByOther(val, player.entityId)
+                                && OwnershipAllowsPosition(loc, localPpd))
                             {
                                 var col = collector;
-                                quad.Add(new StorageSource(col.Items,
+                                quad.Add(new StorageSource(() => col.Items,
                                     () => { col.SetChunkModified(); col.SetModified(); }, "DewCollector"));
                                 DrokkStorage.Dbgl($"  Added TileEntityCollector at {loc}");
                             }
@@ -968,11 +1009,28 @@ public static class DrokkStoragePatches
                         // Workstations: pull from OUTPUT slots only (never fuel/ingredients/tools)
                         if (val is TileEntityWorkstation workstation)
                         {
+                            // !bUserAccessing is not just the "someone else is in it" courtesy check
+                            // the dew collector above does - for a workstation it closes an item
+                            // dupe. While its window is open, XUiC_WorkstationOutputGrid holds
+                            // CLONES of the output stacks (XUiC_ItemStackGrid.SetStacks/getUISlots
+                            // both clone), and nothing ever refreshes those clones from the tile
+                            // entity - XUiC_WorkstationWindowGroup declares TileEntity_OutputChanged
+                            // but never subscribes it. On close, syncTEfromUI() writes the UI's stale
+                            // clones straight back over TileEntity.Output. So any decrement DecItem
+                            // makes to ws.output while the window is up is silently reverted on
+                            // close, and on a client that restored state is then pushed to the
+                            // server as authoritative. Net effect: drop a recipe's ingredients in
+                            // the OUTPUT slot of the workstation you're crafting at, and the craft
+                            // starts without consuming them - cancel it and the refund is free
+                            // items. A workstation you don't have open has no UI shadowing its
+                            // output array, so it stays a valid pull source.
                             if (DrokkStorage.config.pullFromWorkstationOutputs && workstation.IsPlayerPlaced
-                                && workstation.output != null && !IsBeingAccessedByOther(val, player.entityId))
+                                && workstation.output != null && !workstation.bUserAccessing
+                                && !IsBeingAccessedByOther(val, player.entityId)
+                                && OwnershipAllowsPosition(loc, localPpd))
                             {
                                 var ws = workstation;
-                                quad.Add(new StorageSource(ws.output,
+                                quad.Add(new StorageSource(() => ws.output,
                                     () => { ws.SetChunkModified(); ws.SetModified(); }, "Workstation"));
                                 DrokkStorage.Dbgl($"  Added TileEntityWorkstation at {loc}");
                             }
@@ -997,8 +1055,14 @@ public static class DrokkStoragePatches
                                     if (IsBeingAccessedByOther(val, player.entityId))
                                         continue;
 
+                                    // Owner-only gate. Catches the unlocked-crate-owned-by-someone-
+                                    // else case the lock test above deliberately lets through.
+                                    if (!OwnershipAllowsContainer(val, localPpd))
+                                        continue;
+
                                     var teComposite = val;
-                                    quad.Add(new StorageSource(lootable.items, teComposite.SetModified, "Composite"));
+                                    var storage = lootable;
+                                    quad.Add(new StorageSource(() => storage.items, teComposite.SetModified, "Composite"));
                                     DrokkStorage.Dbgl($"  Added TileEntityComposite at {loc}");
                                 }
                             }
@@ -1016,8 +1080,12 @@ public static class DrokkStoragePatches
                             if (IsBeingAccessedByOther(val, player.entityId))
                                 continue;
 
+                            if (!OwnershipAllowsContainer(val, localPpd))
+                                continue;
+
                             var teSecure = val;
-                            quad.Add(new StorageSource(secureLootable.items, teSecure.SetModified, "Loot"));
+                            var secureStorage = secureLootable;
+                            quad.Add(new StorageSource(() => secureStorage.items, teSecure.SetModified, "Loot"));
                             DrokkStorage.Dbgl($"  Added non-composite loot container at {loc}");
                         }
                     }
@@ -1052,7 +1120,7 @@ public static class DrokkStoragePatches
                             && !vehicle.IsLockedForLocalPlayer(player))
                         {
                             var veh = vehicle;
-                            quad.Add(new StorageSource(veh.bag.items,
+                            quad.Add(new StorageSource(() => veh.bag?.items,
                                 () => veh.SetBagModified(), "Vehicle"));
                             DrokkStorage.Dbgl($"  Added EntityVehicle {vehicle.entityId}");
                         }
@@ -1067,7 +1135,7 @@ public static class DrokkStoragePatches
                             && drone.IsUserAllowed(PlatformManager.InternalLocalUserIdentifier))
                         {
                             var dr = drone;
-                            quad.Add(new StorageSource(dl.items, () => dr.SendSyncData(8), "Drone"));
+                            quad.Add(new StorageSource(() => dr.bag?.items, () => dr.SendSyncData(8), "Drone"));
                             DrokkStorage.Dbgl($"  Added EntityDrone {drone.entityId}");
                         }
                     }
@@ -1110,7 +1178,15 @@ public static class DrokkStoragePatches
         return count;
     }
 
-    private static int DecItem(ItemValue item, int count)
+    // _removedItems mirrors the same parameter on every engine DecItem/RemoveItems overload: the
+    // caller hands us a list and we append what we actually took. It is NOT optional bookkeeping -
+    // ItemActionEntryCraft.OnActivated rebuilds the queued recipe's ingredient list from it
+    // whenever any ingredient HasQuality, and that rebuilt list is the ONLY thing
+    // XUiC_RecipeStack.HandleOnPress refunds on cancel. Leave it null on that path and the queued
+    // recipe ends up with zero ingredients, so cancelling a craft whose materials came out of a
+    // nearby container silently destroys them. See known_bugs.md "cancelled craft ate the
+    // ingredients".
+    private static int DecItem(ItemValue item, int count, IList<ItemStack> _removedItems = null)
     {
         int numLeft = count;
         DrokkStorage.Dbgl($"DecItem: Trying to remove {count} {item.ItemClass.GetItemName()}");
@@ -1129,6 +1205,10 @@ public static class DrokkStoragePatches
                     int toRem = Math.Min(numLeft, items[j].count);
                     DrokkStorage.Dbgl($"  Removing {toRem}/{numLeft} from {src.DebugName}");
                     numLeft -= toRem;
+
+                    // Record before the mutation below - Clear() wipes itemValue, and the quality
+                    // carried on that ItemValue is exactly what the refund has to give back.
+                    _removedItems?.Add(new ItemStack(items[j].itemValue.Clone(), toRem));
 
                     if (items[j].count <= toRem)
                         items[j].Clear();
@@ -1215,12 +1295,25 @@ public static class DrokkStoragePatches
         return numLeft;
     }
     
-    private static void DecItemForRemoveItems(IList<ItemStack> _itemStacks, int i, int numLeft)
+    private static void DecItemForRemoveItems(IList<ItemStack> _itemStacks, int i, int numLeft, IList<ItemStack> _removedItems)
     {
         if (!DrokkStorage.config.craftFromContainersEnabled)
             return;
         DrokkStorage.Dbgl($"DecItemForRemoveItems: Removing {numLeft} {_itemStacks[i].itemValue.ItemClass.GetItemName()}");
-        DecItem(_itemStacks[i].itemValue, numLeft);
+        int removed = DecItem(_itemStacks[i].itemValue, numLeft, _removedItems);
+
+        // Always-on: by the time this runs the recipe is already queued (OnActivated calls
+        // AddItemToQueue before RemoveItems), so a shortfall here means the craft started without
+        // paying for it - i.e. a dupe. The count check that let it through and this removal read
+        // the same currentSources, so the only way they disagree is a source that went stale or
+        // is shadowed by an open UI between the two. Worth a log line even with Debug off.
+        if (removed < numLeft)
+        {
+            Log.Warning($" [DrokkStorage] Craft ingredient shortfall: needed {numLeft} more "
+                + $"{_itemStacks[i].itemValue.ItemClass.GetItemName()} from nearby storage but only removed "
+                + $"{removed}. The craft was already queued - this is an unpaid craft. "
+                + $"Sources scanned: {currentSources.Count}");
+        }
     }
     
     private static int DecItemForGetAmmoCountToReload(Inventory inv, ItemValue item, int count, bool modded, IList<ItemStack> _removedItems)
@@ -1231,7 +1324,7 @@ public static class DrokkStoragePatches
         
         int numLeft = count - num;
         DrokkStorage.Dbgl($"DecItemForGetAmmoCountToReload: Removing {numLeft} {item.ItemClass.GetItemName()} for reload");
-        return DecItem(item, numLeft);
+        return DecItem(item, numLeft, _removedItems);
     }
     
     private static int RemoveRemainingForUpgrade(int numRemoved, ItemActionRepair action, BlockValue blockValue)
@@ -1284,6 +1377,95 @@ public static class DrokkStoragePatches
         return totalToRemove - numLeft;
     }
 
+    // ===== OWNERSHIP CHECKS (config.checkOwnership) =====
+    //
+    // Containers record their placer: Chunk.SetBlockRaw stamps
+    // persistentPlayers.GetPlayerDataFromEntityID(changedByEntityId).PrimaryId into
+    // TileEntityComposite.Owner via Block.OnBlockAdded - for every player-placed composite,
+    // whether or not it is ever locked (TileEntityComposite.PlayerPlaced is literally
+    // `Owner != null`). Owner is serialized to clients too, so both the server-side QuickStack
+    // gate and the client-side crafting scan can read it.
+    //
+    // Two gates, only one of which is optional:
+    //   - no owner recorded (POI loot crates, prefab-spawned, debug/creative-placed) => excluded
+    //     ALWAYS, regardless of CheckOwnership. World loot is never a mod source or destination.
+    //   - CheckOwnership additionally requires the owner to be you. Deliberately strict:
+    //     keypad-allowed users (TEFeatureLockable.allowedUserIds) and party allies are NOT
+    //     treated as owners; sharing means sharing the container, not the code.
+
+    // Resolves the requesting player's persistent identity. Server-side this works for the host
+    // and remote clients alike; PrimaryId is the identity Owner was stamped from, so it's the
+    // only thing guaranteed to compare equal.
+    private static PersistentPlayerData GetPersistentPlayerData(int _entityId)
+    {
+        return GameManager.Instance.persistentPlayers?.GetPlayerDataFromEntityID(_entityId);
+    }
+
+    // The container's recorded placer, or null if nothing placed it (POI loot, prefab-spawned,
+    // debug/creative-placed).
+    private static PlatformUserIdentifierAbs GetContainerOwner(TileEntity _tileEntity)
+    {
+        if (_tileEntity == null)
+            return null;
+
+        return (_tileEntity is TileEntityComposite composite)
+            ? composite.Owner
+            : (_tileEntity as ILockable)?.GetOwner();
+    }
+
+    // Unconditional floor, independent of CheckOwnership: a container with no recorded owner is
+    // never part of any mod behaviour. That is the POI loot crate case - we neither quick stack
+    // into, quick restock from, nor craft/repair out of world loot. CheckOwnership then narrows
+    // the remaining player-placed containers further to the ones owned by *you*.
+    public static bool IsPlayerPlacedContainer(TileEntity _tileEntity)
+    {
+        if (_tileEntity == null)
+            return false;
+
+        if (GetContainerOwner(_tileEntity) == null)
+        {
+            DrokkStorage.Dbgl($"Skipping unowned (POI/world) container at {_tileEntity.ToWorldPos()}");
+            return false;
+        }
+
+        return true;
+    }
+
+    // True if _ppd may use the container at all under the current ownership policy.
+    // Unowned containers are rejected either way; the _ppd match is what CheckOwnership adds.
+    public static bool OwnershipAllowsContainer(TileEntity _tileEntity, PersistentPlayerData _ppd)
+    {
+        if (!IsPlayerPlacedContainer(_tileEntity))
+            return false;
+
+        if (!DrokkStorage.config.checkOwnership)
+            return true;
+
+        if (_ppd?.PrimaryId == null)
+            return false;
+
+        return GetContainerOwner(_tileEntity).Equals(_ppd.PrimaryId);
+    }
+
+    // Workstations (TileEntityWorkstation) and dew collectors / apiaries (TileEntityCollector)
+    // are plain TileEntity subclasses in 3.0 with no Owner field at all - only an IsPlayerPlaced
+    // bool, which carries no identity. Land claim is the only ownership signal available for
+    // them, so "inside a land claim of mine" stands in for "mine". Note two engine quirks this
+    // inherits: IsMyLandProtectedBlock returns true unconditionally outside survival
+    // (GameModeId != 1), and it returns false for an unclaimed position - so with CheckOwnership
+    // on, a forge built outside any LCB is not a pullable source.
+    // (forKeystone:false means ally claims do NOT count, matching the owner-only policy above.)
+    public static bool OwnershipAllowsPosition(Vector3i _pos, PersistentPlayerData _ppd)
+    {
+        if (!DrokkStorage.config.checkOwnership)
+            return true;
+
+        if (_ppd == null)
+            return false;
+
+        return GameManager.Instance.World.IsMyLandProtectedBlock(_pos, _ppd);
+    }
+
     // ===== QUICK STACK AND QUICK RESTOCK FUNCTIONALITY =====
 
     public static bool IsContainerUnlocked(int _entityIdThatOpenedIt, TileEntity _tileEntity)
@@ -1332,6 +1514,14 @@ public static class DrokkStoragePatches
                         return false;
                 }
             }
+
+            // Ownership gate. The unowned-container half is always on (no POI loot, ever); the
+            // owner-must-be-you half is CheckOwnership. Applies regardless of lock state: an
+            // *unlocked* crate belonging to another player is exactly the case the lock checks
+            // above let through. Resolved from the requesting player's entity id, so it's
+            // correct for the host and every remote client.
+            if (!OwnershipAllowsContainer(_tileEntity, GetPersistentPlayerData(_entityIdThatOpenedIt)))
+                return false;
 
             // Skip containers another living player currently has open (avoids racing their live
             // QuickStack edits). 3.0 removed GameManager.lockedTileEntities, so this now reads from
@@ -1675,23 +1865,27 @@ public static class DrokkStoragePatches
 
     // ===== TRANSPILER PATCHES FOR CRAFTING =====
     
-    [HarmonyPatch(typeof(ItemActionEntryCraft), nameof(ItemActionEntryCraft.OnActivated))]
-    public static class ItemActionEntryCraft_OnActivated_Patch
+    // The GetAllItemStacks() call lives in hasItems(), not OnActivated() - OnActivated only calls
+    // hasItems(). Patching OnActivated found no injection point and silently left quality-item
+    // ingredients unable to be sourced from nearby containers.
+    [HarmonyPatch(typeof(ItemActionEntryCraft), "hasItems")]
+    public static class ItemActionEntryCraft_hasItems_Patch
     {
         public static IEnumerable<CodeInstruction> Transpiler(IEnumerable<CodeInstruction> instructions)
         {
             var codes = new List<CodeInstruction>(instructions);
             int patched = 0;
+            var target = AccessTools.Method(typeof(XUiM_PlayerInventory), nameof(XUiM_PlayerInventory.GetAllItemStacks));
             for (int i = 0; i < codes.Count; i++)
             {
-                if (codes[i].opcode == OpCodes.Callvirt && (MethodInfo)codes[i].operand == AccessTools.Method(typeof(XUiM_PlayerInventory), nameof(XUiM_PlayerInventory.GetAllItemStacks)))
+                if ((codes[i].opcode == OpCodes.Callvirt || codes[i].opcode == OpCodes.Call) && (MethodInfo)codes[i].operand == target)
                 {
                     codes.Insert(i + 1, new CodeInstruction(OpCodes.Call, AccessTools.Method(typeof(DrokkStoragePatches), nameof(GetAllStorageStacksList))));
                     patched++;
                     break;
                 }
             }
-            LogPatchResult("ItemActionEntryCraft.OnActivated", patched);
+            LogPatchResult("ItemActionEntryCraft.hasItems", patched);
             return codes.AsEnumerable();
         }
     }
@@ -1757,7 +1951,11 @@ public static class DrokkStoragePatches
                     var ci = codes[i + 3];
                     var ciNew = new CodeInstruction(OpCodes.Ldarg_1);
                     ci.MoveLabelsTo(ciNew);
+                    // Each Insert at the same index pushes the previous one back, so these read
+                    // bottom-up: ldarg.1 (_itemStacks), ldloc.0 (i), ldloc.1 (numLeft),
+                    // ldarg.3 (_removedItems), call.
                     codes.Insert(i + 3, new CodeInstruction(OpCodes.Call, AccessTools.Method(typeof(DrokkStoragePatches), nameof(DecItemForRemoveItems))));
+                    codes.Insert(i + 3, new CodeInstruction(OpCodes.Ldarg_3));
                     codes.Insert(i + 3, new CodeInstruction(OpCodes.Ldloc_1));
                     codes.Insert(i + 3, new CodeInstruction(OpCodes.Ldloc_0));
                     codes.Insert(i + 3, ciNew);
@@ -1794,7 +1992,10 @@ public static class DrokkStoragePatches
                     var ci = codes[i + 3];
                     var ciNew = new CodeInstruction(OpCodes.Ldarg_1);
                     ci.MoveLabelsTo(ciNew);
+                    // See the comment on the XUiM_PlayerInventory patch above - same arg order,
+                    // ldarg.3 is this overload's _removedItems too.
                     codes.Insert(i + 3, new CodeInstruction(OpCodes.Call, AccessTools.Method(typeof(DrokkStoragePatches), nameof(DecItemForRemoveItems))));
+                    codes.Insert(i + 3, new CodeInstruction(OpCodes.Ldarg_3));
                     codes.Insert(i + 3, new CodeInstruction(OpCodes.Ldloc_1));
                     codes.Insert(i + 3, new CodeInstruction(OpCodes.Ldloc_0));
                     codes.Insert(i + 3, ciNew);
@@ -2422,6 +2623,47 @@ public static class DrokkStoragePatches
     [HarmonyPatch(typeof(XUiC_BackpackWindow), "GetBindingValueInternal")]
     public static class BackpackWindow_GetBindingValueInternal_Patch
     {
+        // Window structure is fixed once XUi is parsed, so "does this group own an item grid"
+        // only ever needs answering once per group id.
+        private static readonly Dictionary<string, bool> groupOwnsGridCache = new Dictionary<string, bool>();
+
+        // True when a window group other than the player's own backpack is open and shows its own
+        // item grid (drone / bag storage, loot, dew collector, workstations, ...). Vehicle storage
+        // and loot are already covered by their own flags; this is the catch-all.
+        public static bool IsForeignContainerWindowOpen(XUi xui)
+        {
+            GUIWindowManager wm = xui?.playerUI?.windowManager;
+            if (wm == null)
+                return false;
+
+            return AnyForeignContainer(wm.openWindows) || AnyForeignContainer(wm.windowsToOpen);
+        }
+
+        private static bool AnyForeignContainer(List<GUIWindow> windows)
+        {
+            for (int i = 0; i < windows.Count; i++)
+            {
+                XUiWindowGroup group = windows[i] as XUiWindowGroup;
+                if (group == null || group.Controller == null)
+                    continue;
+                // "backpack" is the player's own inventory window group - the one these buttons
+                // belong to - and HUD groups (compass, tooltip, ...) own no grid.
+                if (string.Equals(group.Id, "backpack", StringComparison.OrdinalIgnoreCase))
+                    continue;
+
+                if (!groupOwnsGridCache.TryGetValue(group.Id, out bool ownsGrid))
+                {
+                    ownsGrid = group.Controller.GetChildByType<XUiC_ItemStackGrid>() != null;
+                    groupOwnsGridCache[group.Id] = ownsGrid;
+                }
+
+                if (ownsGrid)
+                    return true;
+            }
+
+            return false;
+        }
+
         public static void Postfix(ref bool __result, XUiC_BackpackWindow __instance, ref string value, string bindingName)
         {
             try
@@ -2433,9 +2675,14 @@ public static class DrokkStoragePatches
                     bool flag1 = __instance.xui.Vehicle != null && __instance.xui.Vehicle.CurrentVehicle != null && __instance.xui.Vehicle.CurrentVehicle.GetVehicle().HasStorage();
                     // 3.0: loot containers are position-backed (no EntityId), and drone storage no
                     // longer opens through XUi.LootContainer, so an open LootContainer just means
-                    // "looting a container" and the old drone-via-loot check (flag3) is obsolete.
+                    // "looting a container".
                     bool flag2 = __instance.xui.LootContainer != null;
-                    bool flag3 = false;
+                    // Drone / bag storage opens XUiC_BagStorageWindowGroup alongside the backpack
+                    // and never touches XUi.LootContainer, so neither flag above catches it. Test
+                    // the window stack directly instead of enumerating every container type: any
+                    // open window group other than "backpack" that owns its own item grid is a
+                    // second inventory, and the quick stack / restock buttons must stay hidden.
+                    bool flag3 = IsForeignContainerWindowOpen(__instance.xui);
                     value = (!flag1 && !flag2 && !flag3).ToString();
                     __result = true;
                 }
@@ -2573,6 +2820,33 @@ public static class DrokkStoragePatches
                     Log.Out($"[DrokkStorage] Debug Stack: Item={__instance.ItemStack.itemValue.ItemClass.GetItemName()}, StackLock={__instance.StackLock}, QuestLock={__instance.QuestLock}, AllowDropping={__instance.AllowDropping}, Location={__instance.StackLocation}");
                 }
             }
+        }
+    }
+}
+
+// Server-side: a remote client just spawned in. Push the server's gameplay settings so every
+// player on the server is playing by the same rules, no matter what their local
+// Config/settings.xml says. Most of this mod's enforcement runs client-side, so without this a
+// server admin's settings.xml is simply ignored by connected players. See
+// NetPackageDrokkStorageConfig.
+[HarmonyPatch(typeof(GameManager), nameof(GameManager.PlayerSpawnedInWorld))]
+public static class DrokkStorageConfigSyncOnSpawn
+{
+    public static void Postfix(ClientInfo _cInfo)
+    {
+        // _cInfo is null for the host's own local player, which already reads the same config
+        // object the server side does - nothing to sync.
+        if (_cInfo == null)
+            return;
+
+        try
+        {
+            _cInfo.SendPackage(NetPackageManager.GetPackage<NetPackageDrokkStorageConfig>()
+                .Setup(DrokkStorage.config));
+        }
+        catch (Exception e)
+        {
+            Log.Error($" [DrokkStorage] Failed to send config to client: {e.Message}");
         }
     }
 }
