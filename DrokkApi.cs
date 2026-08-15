@@ -7,8 +7,25 @@ using System;
 //
 // Normally requests go to production (drokkmods.fyi). Launching the game with -staging
 // (build_and_run.sh -staging passes it through) points them at the staging Cloud Run
-// revision instead. Each mod compiles its own copy of this type, so the flag is read
-// per-assembly; it is a launch argument, so every copy resolves to the same answer.
+// revision instead.
+//
+// SHARED-STATE AUDIT: `resolved` and `baseUrl` below are plain mutable statics, which in any
+// other _Shared file would be the bug documented in DrokkModUpdateChecker.cs (each mod
+// compiles its own copy of this type, so those fields are per-assembly). Here it is correct
+// and deliberately left alone. They are a memoized pure function of
+// Environment.GetCommandLineArgs(), which is fixed for the life of the process and identical
+// for every assembly in it, so all 14 copies compute the same answer and no copy ever
+// observes another's write. Nothing outside this file writes them, so there is no
+// cross-assembly sender/reader split to get wrong.
+//
+// The only per-assembly artifact is cosmetic: the "-staging detected" line logs once per
+// assembly that ever calls BaseUrl, not once per process. Left as-is — it names no mod, and
+// routing the resolve through AppDomain data to silence a duplicate log line would add a
+// shared key that has to stay type-compatible across generations forever.
+//
+// If this file ever gains state that is NOT derived from immutable process input — a cached
+// auth token, a retry counter, a runtime host override — that state must move to
+// AppDomain.CurrentDomain Get/SetData. See mods/_Shared/README.md.
 public static class DrokkApi
 {
     private const string ProductionBaseUrl = "https://drokkmods.fyi";
