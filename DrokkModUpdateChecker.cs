@@ -48,7 +48,10 @@ public static class DrokkModUpdateChecker
     //        key unset, so a gen-3 controller would render blank -- hence the legacy bridge
     //        in BroadcastPendingMessage/ReadLegacyPendingMessage, which keeps gen-2 and gen-3
     //        copies interoperating in BOTH directions until every deployed mod is gen 3.
-    private const int Generation = 3;
+    // gen 4: dismiss the notice when the main menu window group closes (vanilla news boxes
+    //        get this for free by living inside that group; we are a separate overlay), and
+    //        refuse to Open() it if the player has already left the menu (HTTP race).
+    private const int Generation = 4;
     // Host comes from DrokkApi so -staging redirects this (and every other Drokk API
     // call) to the staging backend in one place.
     private const string UpdatePath = "/api/updates";
@@ -209,6 +212,17 @@ public static class DrokkModUpdateChecker
 
     private static void MainMenu_OnOpen_Postfix(XUiC_MainMenu __instance)
     {
+        // Vanilla news boxes (mainMenuNews) live inside the mainMenu window_group, so they
+        // vanish whenever that group closes — Play Game (modal swap), Options, Credits, etc.
+        // Ours is a separate non-modal group, so we have to dismiss it ourselves. OnWindowClose
+        // is cleared by GUIWindow.OnClose after it fires, so re-subscribe on every open.
+        XUiWindowGroup group = __instance.WindowGroup;
+        if (group != null)
+        {
+            XUi xui = group.xui;
+            group.OnWindowClose += () => DismissUpdateNotice(xui, "main menu closed");
+        }
+
         if (HasCheckedThisSession) return;
         HasCheckedThisSession = true;
 
@@ -219,6 +233,22 @@ public static class DrokkModUpdateChecker
         }
 
         ThreadManager.StartCoroutine(CheckForUpdates(__instance));
+    }
+
+    // SHARED-safe: only talks to GUIWindowManager by the global group name, so it does not
+    // matter which assembly owns the notice's controller.
+    internal static void DismissUpdateNotice(XUi xui, string reason)
+    {
+        var windowManager = xui?.playerUI?.windowManager;
+        if (windowManager == null || !windowManager.IsWindowOpen(XUiC_DrokkUpdateNotice.GroupID)) return;
+        Log.Out($" [DrokkModUpdateChecker] Dismissing update notice ({reason}).");
+        windowManager.Close(XUiC_DrokkUpdateNotice.GroupID);
+    }
+
+    internal static bool MainMenuIsOpen(XUi xui)
+    {
+        var windowManager = xui?.playerUI?.windowManager;
+        return windowManager != null && windowManager.IsWindowOpen(XUiC_MainMenu.ID);
     }
 
     private static void EnsureSettingsLoaded()
@@ -345,6 +375,13 @@ public static class DrokkModUpdateChecker
 
             if (!TryParseResponse(req.downloadHandler.text, out string message))
             {
+                yield break;
+            }
+
+            // The request can take a few seconds; the player may already have hit Play / Options.
+            if (!MainMenuIsOpen(mainMenu.xui))
+            {
+                Log.Out(" [DrokkModUpdateChecker] Update available but player left the main menu; not showing notice.");
                 yield break;
             }
 

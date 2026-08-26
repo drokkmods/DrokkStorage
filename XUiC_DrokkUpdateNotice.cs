@@ -47,6 +47,18 @@ public class XUiC_DrokkUpdateNotice : XUiController
         if (_messageScroll != null) ThreadManager.StartCoroutine(RefreshScrollBounds());
     }
 
+    // Fallback if the checker's OnWindowClose hook missed this close (older gen owning Harmony,
+    // or a path that hides the menu without firing GUIWindow.OnClose). Vanilla news boxes never
+    // need this because they are children of the mainMenu window_group.
+    public override void Update(float _dt)
+    {
+        base.Update(_dt);
+        if (!DrokkModUpdateChecker.MainMenuIsOpen(xui))
+        {
+            DrokkModUpdateChecker.DismissUpdateNotice(xui, "main menu no longer open");
+        }
+    }
+
     // Shared state first. The fallback covers a gen-2 sender (whose Show() only set its own
     // assembly's private static and never wrote the shared key) opening a gen-3 window; see
     // the gen-2/gen-3 bridge in DrokkModUpdateChecker.
@@ -117,7 +129,15 @@ public class XUiC_DrokkUpdateNotice : XUiController
 
         // Non-modal: floats below the vanilla news boxes without blocking or hiding the main
         // menu underneath it (modal=true was what previously required reopening XUiC_MainMenu
-        // on close, since it forced the main menu group closed).
+        // on close, since it forced the main menu group closed). Being non-modal also means
+        // vanilla will NOT close us when it swaps the main menu for Play Game / Options — the
+        // checker dismisses us from the main menu group's OnWindowClose for that.
+        if (!DrokkModUpdateChecker.MainMenuIsOpen(_xuiInstance))
+        {
+            Log.Out(" [DrokkModUpdateChecker] Update available but main menu is no longer open; not showing notice.");
+            return;
+        }
+
         windowManager.Open(GroupID, false);
     }
 }
