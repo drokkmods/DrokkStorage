@@ -484,6 +484,7 @@ public static class DrokkStoragePatches
         {
             openWindow = window;
             lastQueueSignature = null;
+            lastLocalRefresh = 0f;
         }
 
         public static void WindowClosed(XUiC_WorkstationWindowGroup window)
@@ -493,6 +494,29 @@ public static class DrokkStoragePatches
             // NOTE: the queue is NOT reset here. OnClose runs its own syncTEfromUI *after* this,
             // and MergeWithTileEntity (which that write goes through) works off the tile entity
             // plus the local player's entity id, neither of which needs the window.
+        }
+
+        private static float lastLocalRefresh = 0f;
+
+        public static void TickLocalRefresh()
+        {
+            try
+            {
+                if (!DrokkStorage.config.multiViewersEnabled) return;
+                if (openWindow == null) return;
+                var cm = SingletonMonoBehaviour<ConnectionManager>.Instance;
+                if (cm == null || !cm.IsServer) return;
+                TileEntityWorkstation te = openWindow.WorkstationData?.TileEntity;
+                if (te == null) return;
+                float now = Time.unscaledTime;
+                if (now - lastLocalRefresh < 0.5f) return;
+                lastLocalRefresh = now;
+                RefreshFromTileEntity(te);
+            }
+            catch (Exception e)
+            {
+                DrokkStorage.Dbgl(e.Message);
+            }
         }
 
         public static bool IsOpenOn(TileEntityWorkstation te)
@@ -3427,6 +3451,8 @@ public static class DrokkStoragePatches
             {
                 if (GameManager.Instance.World == null || GameManager.Instance.World.GetPrimaryPlayer() == null)
                     return;
+
+                WorkstationLiveSync.TickLocalRefresh();
 
                 if (UICamera.GetKeyDown(DrokkStorage.config.quickStackHotkeys[DrokkStorage.config.quickStackHotkeys.Length - 1]))
                 {
